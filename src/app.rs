@@ -11,10 +11,13 @@ pub struct App {
     visible: bool,
     just_shown: bool,
     query: String,
-    query_lc: String,       // cached lowercase, updated only when query changes
+    query_lc: String,
     clipboard: Clipboard,
     img_cache: HashMap<u64, TextureHandle>,
     pub hotkey_triggered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    paused: bool,           // when true, ignore incoming clipboard events
+    status_str: String,     // cached status bar string
+    status_count: usize,    // last count used to build status_str
 }
 
 impl App {
@@ -22,8 +25,10 @@ impl App {
         rx: Receiver<ClipContent>,
         hotkey_triggered: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
+        let store = Store::load();
+        let count = store.entries.len();
         Self {
-            store: Store::load(),
+            store,
             rx,
             visible: true,
             just_shown: true,
@@ -32,6 +37,25 @@ impl App {
             clipboard: Clipboard::new().expect("clipboard init failed"),
             img_cache: HashMap::new(),
             hotkey_triggered,
+            paused: false,
+            status_str: Self::make_status(count, false),
+            status_count: count,
+        }
+    }
+
+    fn make_status(count: usize, paused: bool) -> String {
+        if paused {
+            format!("{} 条记录  •  已暂停  •  Ctrl+Shift+V 呼出  •  Esc 隐藏", count)
+        } else {
+            format!("{} 条记录  •  Ctrl+Shift+V 呼出  •  Esc 隐藏", count)
+        }
+    }
+
+    fn refresh_status(&mut self) {
+        let count = self.store.entries.len();
+        if count != self.status_count || self.paused != (self.status_str.contains("已暂停")) {
+            self.status_count = count;
+            self.status_str = Self::make_status(count, self.paused);
         }
     }
 
@@ -64,8 +88,10 @@ impl App {
 }
 
 impl eframe::App for App {
-    // Override close to minimize instead of quit
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {}
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Flush any pending writes before process exits
+        self.store.flush_now();
+    }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Intercept window close → hide instead of exit
@@ -80,11 +106,18 @@ impl eframe::App for App {
             if self.visible { self.hide(ctx); } else { self.show(ctx); }
         }
 
-        // Drain new clipboard entries
+        // Drain new clipboard entries (skip if paused)
+        let mut got_new = false;
         while let Ok(content) = self.rx.try_recv() {
-            self.store.push(content);
-            if self.visible { ctx.request_repaint(); }
+            if !self.paused {
+                self.store.push(content);
+                got_new = true;
+            }
         }
+        if got_new && self.visible { ctx.request_repaint(); }
+
+        // Flush dirty store to disk (debounced, max once per 2s)
+        self.store.flush_if_needed();
 
         if !self.visible {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -95,6 +128,13 @@ impl eframe::App for App {
             self.hide(ctx);
             return;
         }
+
+        // Update query_lc only when query changes (not every frame)
+        let new_lc = self.query.to_lowercase();
+        if new_lc != self.query_lc { self.query_lc = new_lc; }
+
+        // Refresh cached status string
+        self.refresh_status();
 
         egui::TopBottomPanel::top("search_bar").show(ctx, |ui| {
             ui.add_space(6.0);
@@ -107,9 +147,14 @@ impl eframe::App for App {
                 );
                 if self.just_shown { resp.request_focus(); }
 
-                // Update cached lowercase only when query changes
-                let new_lc = self.query.to_lowercase();
-                if new_lc != self.query_lc { self.query_lc = new_lc; }
+                // Pause toggle
+                let pause_label = if self.paused { "▶" } else { "⏸" };
+                if ui.small_button(pause_label)
+                    .on_hover_text(if self.paused { "恢复记录" } else { "暂停记录" })
+                    .clicked()
+                {
+                    self.paused = !self.paused;
+                }
 
                 if ui.button("🗑").on_hover_text("清除所有未固定条目").clicked() {
                     self.store.clear_unpinned();
@@ -120,18 +165,12 @@ impl eframe::App for App {
         });
 
         egui::TopBottomPanel::bottom("hint").show(ctx, |ui| {
-            ui.label(
-                RichText::new(format!(
-                    "{} 条记录  •  Ctrl+Shift+V 呼出  •  Esc 隐藏",
-                    self.store.entries.len()
-                ))
-                .small()
-                .color(Color32::GRAY),
-            );
+            ui.label(RichText::new(&self.status_str).small().color(
+                if self.paused { Color32::from_rgb(200, 150, 50) } else { Color32::GRAY }
+            ));
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Single-pass partition: pinned + recent, filtered
             let mut pinned: Vec<&ClipEntry> = Vec::new();
             let mut recent: Vec<&ClipEntry> = Vec::new();
             for e in &self.store.entries {
@@ -159,12 +198,11 @@ impl eframe::App for App {
                     ui.separator();
                 }
 
-                // Time-grouped recent entries
                 let now = chrono::Local::now();
                 let today = now.date_naive();
                 let yesterday = today.pred_opt().unwrap_or(today);
-
                 let mut last_group = "";
+
                 for e in &recent {
                     let date = e.time.date_naive();
                     let group = if date == today { "今天" }
@@ -228,15 +266,8 @@ fn render_entry(
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                // Time
-                ui.label(
-                    RichText::new(entry.time.format("%H:%M").to_string())
-                        .small().color(Color32::DARK_GRAY),
-                );
-                // Stats (char count / image size)
-                ui.label(
-                    RichText::new(&entry.stats).small().color(Color32::DARK_GRAY),
-                );
+                ui.label(RichText::new(entry.time.format("%H:%M").to_string()).small().color(Color32::DARK_GRAY));
+                ui.label(RichText::new(&entry.stats).small().color(Color32::DARK_GRAY));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button(RichText::new("✕").color(Color32::DARK_GRAY)).clicked() {
                         action = Some(Action::Delete(entry.id));
@@ -256,11 +287,16 @@ fn render_entry(
                             .truncate(),
                     );
                     if resp.clicked() { action = Some(Action::Copy(entry.id)); }
+                    // Compute char count once for hover
+                    let char_count = text.chars().count();
                     let resp = resp.on_hover_ui(|ui| {
                         ui.set_max_width(420.0);
-                        let preview: String = text.chars().take(2000).collect();
-                        let suffix = if text.chars().count() > 2000 { "\n…" } else { "" };
-                        ui.label(RichText::new(format!("{}{}", preview.trim(), suffix)).monospace().size(12.0));
+                        if char_count <= 2000 {
+                            ui.label(RichText::new(text.trim()).monospace().size(12.0));
+                        } else {
+                            let preview: String = text.chars().take(2000).collect();
+                            ui.label(RichText::new(format!("{}…", preview.trim())).monospace().size(12.0));
+                        }
                     });
                     resp.context_menu(|ui| {
                         if ui.button("📋  复制").clicked() {
