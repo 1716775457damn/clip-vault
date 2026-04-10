@@ -35,7 +35,7 @@ fn main() -> eframe::Result {
     tray_menu.append(&show_item).ok();
     tray_menu.append(&quit_item).ok();
 
-    let icon = tray_icon::Icon::from_rgba(make_icon(), 16, 16).expect("icon failed");
+    let icon = tray_icon::Icon::from_rgba(make_icon(), 32, 32).expect("icon failed");
     let _tray = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
         .with_tooltip("Clip Vault")
@@ -78,20 +78,69 @@ fn main() -> eframe::Result {
     }))
 }
 
+/// 32×32 RGBA clipboard icon with rounded corners, clip bar, and text lines
 fn make_icon() -> Vec<u8> {
-    let mut px = vec![0u8; 16 * 16 * 4];
-    for y in 0..16usize {
-        for x in 0..16usize {
-            let i = (y * 16 + x) * 4;
-            let on = (x >= 1 && x <= 14 && y >= 1 && y <= 14)
-                && !(x >= 3 && x <= 12 && y >= 3 && y <= 12);
-            if on || (x >= 4 && x <= 11 && y >= 5 && y <= 11) {
-                px[i]   = 80;
-                px[i+1] = 140;
-                px[i+2] = 220;
-                px[i+3] = 255;
+    const S: usize = 32;
+    let mut px = vec![0u8; S * S * 4];
+
+    let set = |px: &mut Vec<u8>, x: usize, y: usize, r: u8, g: u8, b: u8, a: u8| {
+        if x < S && y < S {
+            let i = (y * S + x) * 4;
+            px[i] = r; px[i+1] = g; px[i+2] = b; px[i+3] = a;
+        }
+    };
+
+    // Draw filled rounded rectangle (clipboard body): x 3..28, y 5..30, radius 3
+    for y in 0..S {
+        for x in 0..S {
+            let (fx, fy) = (x as i32, y as i32);
+            // Body: rounded rect 3..28, 5..30
+            let in_body = fx >= 3 && fx <= 28 && fy >= 5 && fy <= 30;
+            // Corner cutouts
+            let corner = (fx < 6 && fy < 8) || (fx > 25 && fy < 8)
+                      || (fx < 6 && fy > 27) || (fx > 25 && fy > 27);
+            // Clip bar at top: x 10..21, y 3..9
+            let clip_bar = fx >= 10 && fx <= 21 && fy >= 3 && fy <= 9;
+            // Clip bar hole: x 13..18, y 3..6
+            let clip_hole = fx >= 13 && fx <= 18 && fy >= 3 && fy <= 6;
+
+            if clip_bar && !clip_hole {
+                // Clip bar: darker blue-grey
+                set(&mut px, x, y, 90, 110, 160, 255);
+            } else if in_body && !corner {
+                // Body gradient: top is lighter, bottom darker
+                let t = fy as f32 / S as f32;
+                let r = (100.0 - t * 20.0) as u8;
+                let g = (150.0 - t * 30.0) as u8;
+                let b = (230.0 - t * 20.0) as u8;
+                set(&mut px, x, y, r, g, b, 255);
             }
         }
     }
+
+    // Text lines on clipboard body (white, semi-transparent)
+    // Line 1: y=13, x 7..24
+    for x in 7..25usize { set(&mut px, x, 13, 255, 255, 255, 200); }
+    for x in 7..25usize { set(&mut px, x, 14, 255, 255, 255, 200); }
+    // Line 2: y=18, x 7..24
+    for x in 7..25usize { set(&mut px, x, 18, 255, 255, 255, 200); }
+    for x in 7..25usize { set(&mut px, x, 19, 255, 255, 255, 200); }
+    // Line 3: y=23, x 7..18 (shorter)
+    for x in 7..19usize { set(&mut px, x, 23, 255, 255, 255, 200); }
+    for x in 7..19usize { set(&mut px, x, 24, 255, 255, 255, 200); }
+
+    // Border: 1px outline around body
+    for y in 5..=30usize {
+        for x in 3..=28usize {
+            let (fx, fy) = (x as i32, y as i32);
+            let on_edge = fx == 3 || fx == 28 || fy == 5 || fy == 30;
+            let corner = (fx < 6 && fy < 8) || (fx > 25 && fy < 8)
+                      || (fx < 6 && fy > 27) || (fx > 25 && fy > 27);
+            if on_edge && !corner {
+                set(&mut px, x, y, 60, 90, 180, 255);
+            }
+        }
+    }
+
     px
 }
