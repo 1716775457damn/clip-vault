@@ -337,7 +337,7 @@ impl eframe::App for App {
                         if let Some(entry) = self.store.entries.iter().find(|e| e.id == id).cloned() {
                             self.copy_entry(&entry);
                             self.store.push(entry.content);
-                            self.hide_next_frame = true;
+                            // Window stays open — user can continue browsing
                         }
                     }
                     Action::Pin(id) => { self.store.toggle_pin(id); }
