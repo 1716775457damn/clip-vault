@@ -76,19 +76,21 @@ fn main() -> eframe::Result {
 
     eframe::run_native("Clip Vault", options, Box::new(|cc| {
         let mut fonts = egui::FontDefinitions::default();
-        let cjk_font_paths: &[&str] = &[
-            "C:\\Windows\\Fonts\\msyh.ttc",
-            "/System/Library/Fonts/PingFang.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        ];
-        for path in cjk_font_paths {
-            if let Ok(bytes) = std::fs::read(path) {
-                fonts.font_data.insert("cjk".to_owned(), egui::FontData::from_owned(bytes).into());
-                fonts.families.entry(egui::FontFamily::Proportional).or_default().push("cjk".to_owned());
-                fonts.families.entry(egui::FontFamily::Monospace).or_default().push("cjk".to_owned());
-                break;
-            }
-        }
+
+        // Embed Noto Sans SC for guaranteed CJK support on all platforms
+        let cjk_bytes: &[u8] = include_bytes!("../assets/NotoSansSC-Regular.otf");
+        fonts.font_data.insert(
+            "cjk".to_owned(),
+            egui::FontData::from_static(cjk_bytes).into(),
+        );
+        fonts.families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .push("cjk".to_owned());
+        fonts.families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .push("cjk".to_owned());
         cc.egui_ctx.set_fonts(fonts);
         Ok(Box::new(App::new(rx, triggered, tray_rx)))
     }))
