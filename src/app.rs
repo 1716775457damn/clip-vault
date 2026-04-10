@@ -10,6 +10,7 @@ pub struct App {
     pub rx: Receiver<ClipContent>,
     visible: bool,
     just_shown: bool,
+    hide_next_frame: bool,  // delay hide by one frame so clipboard write completes
     query: String,
     query_lc: String,
     last_query_for_lc: String,  // tracks last query used to build query_lc
@@ -35,6 +36,7 @@ impl App {
             rx,
             visible: true,
             just_shown: true,
+            hide_next_frame: false,
             query: String::new(),
             query_lc: String::new(),
             last_query_for_lc: String::new(),
@@ -103,6 +105,12 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Delayed hide — execute one frame after clipboard write
+        if self.hide_next_frame {
+            self.hide_next_frame = false;
+            self.hide(ctx);
+            return;
+        }
         // Intercept window close → hide instead of exit
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -241,7 +249,7 @@ impl eframe::App for App {
                             self.copy_entry(&entry);
                             self.store.push(entry.content);
                             self.selected_idx = None;
-                            self.hide(ctx);
+                            self.hide_next_frame = true;
                             return;
                         }
                     }
@@ -269,7 +277,7 @@ impl eframe::App for App {
                                 self.copy_entry(&entry);
                                 self.store.push(entry.content);
                                 self.selected_idx = None;
-                                self.hide(ctx);
+                                self.hide_next_frame = true;
                                 return;
                             }
                         }
@@ -329,7 +337,7 @@ impl eframe::App for App {
                         if let Some(entry) = self.store.entries.iter().find(|e| e.id == id).cloned() {
                             self.copy_entry(&entry);
                             self.store.push(entry.content);
-                            self.hide(ctx);
+                            self.hide_next_frame = true;
                         }
                     }
                     Action::Pin(id) => { self.store.toggle_pin(id); }
