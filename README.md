@@ -11,7 +11,7 @@
 
 ## ✨ Why Clip Vault?
 
-The Windows clipboard only holds one item. Every time you copy something new, the previous content is gone forever. **Clip Vault** runs silently in the background and remembers everything — text, code snippets, URLs, images — so you can retrieve any of it instantly.
+The system clipboard only holds one item. Every time you copy something new, the previous content is gone forever. **Clip Vault** runs silently in the background and remembers everything — text, code snippets, URLs, images — so you can retrieve any of it instantly.
 
 - ⚡ **Always ready** — `Ctrl+Shift+V` summons the window from anywhere, instantly
 - 🔍 **Instant search** — find any past copy in milliseconds, supports Chinese
@@ -36,23 +36,34 @@ The Windows clipboard only holds one item. Every time you copy something new, th
 - **Character & line count** — each text entry shows its size (e.g. `3 行 128 字`)
 - **Image dimensions** — image entries show their pixel size (e.g. `1920×1080`)
 - **Hover preview** — hover over any entry to see the full content (up to 2000 chars)
+- **Sequence numbers** — entries 1–9 show their number for keyboard shortcuts
 
 ### Search
 - **Real-time filtering** — type to instantly filter all entries
+- **✕ Clear button** — one click to clear the search box
 - **Chinese support** — full Unicode search, works with CJK text
 - **Case-insensitive** — finds matches regardless of capitalization
 
-### Interface
+### Keyboard Shortcuts
 - **`Ctrl+Shift+V`** — toggle the window from anywhere, even inside other apps
-- **`Esc`** — hide the window
-- **Click to copy** — click any entry to copy it and hide the window
+- **`Esc`** — minimize the window
+- **`1`–`9`** — instantly copy the nth visible entry and close the window
+- **`↑` / `↓`** — navigate entries with arrow keys
+- **`Enter`** — copy the selected entry and close the window
+
+### Interface
+- **Click to copy** — click any entry to copy it (window stays open)
 - **Right-click menu** — copy, pin/unpin, or delete any entry
-- **Close button hides** — clicking ✕ hides to background, doesn't quit
+- **System tray icon** (Windows) — right-click for Show / Quit
+- **Close button minimizes** — clicking ✕ minimizes to taskbar, program keeps running
 - **Always on top** — window stays above other apps so you can paste immediately
 - **Auto-focus search** — search box is ready to type the moment the window appears
 
 ### Data
-- **Persistent storage** — history saved to `%LOCALAPPDATA%\clip-vault\history.json` (Windows) or `~/Library/Application Support/clip-vault/history.json` (macOS)
+- **Persistent storage**
+  - Windows: `%LOCALAPPDATA%\clip-vault\history.json`
+  - macOS: `~/Library/Application Support/clip-vault/history.json`
+  - Linux: `~/.local/share/clip-vault/history.json`
 - **Debounced writes** — disk writes are batched (max once per 2 seconds) to avoid I/O thrash
 - **Safe shutdown** — pending writes are flushed immediately on exit, no data loss
 - **Images not persisted** — image bytes are kept in memory only (too large for JSON)
@@ -63,21 +74,21 @@ The Windows clipboard only holds one item. Every time you copy something new, th
 
 ```
 ┌─────────────────────────────────────┐
-│ 🔍 [搜索历史…              ] ⏸ 🗑   │
+│ 🔍 [搜索历史…         ] ✕  ⏸ 🗑    │
 ├─────────────────────────────────────┤
 │ 📌 已固定                            │
 │ ┌─────────────────────────────────┐ │
-│ │ 14:22  3 行 87 字          📌 ✕ │ │
+│ │ 1  14:22  3 行 87 字       📌 ✕ │ │
 │ │ const MAX_RESULTS: usize = 2000 │ │
 │ └─────────────────────────────────┘ │
 ├─────────────────────────────────────┤
 │ 今天                                 │
 │ ┌─────────────────────────────────┐ │
-│ │ 15:41  128 字              📌 ✕ │ │
+│ │ 2  15:41  128 字           📌 ✕ │ │
 │ │ https://github.com/...          │ │
 │ └─────────────────────────────────┘ │
 │ ┌─────────────────────────────────┐ │
-│ │ 15:38  1920×1080           📌 ✕ │ │
+│ │ 3  15:38  1920×1080        📌 ✕ │ │
 │ │ [图片预览]                       │ │
 │ └─────────────────────────────────┘ │
 ├─────────────────────────────────────┤
@@ -127,11 +138,16 @@ open "target/release/bundle/osx/Clip Vault.app"
 > ℹ️ On first launch macOS may show a security warning.  
 > Go to **System Settings → Privacy & Security** and click **Open Anyway**.
 
-> ⚠️ The global hotkey (`Ctrl+Shift+V`) requires **Accessibility permission** on macOS.  
-> Go to **System Settings → Privacy & Security → Accessibility** and add Clip Vault.
+> ⚠️ **Accessibility permission required for the global hotkey (`Ctrl+Shift+V`)**  
+> 1. Open **System Settings → Privacy & Security → Accessibility**  
+> 2. Click the **+** button and add `clip-vault` (or `Clip Vault.app`)  
+> 3. Make sure the toggle is **enabled**  
+> Without this permission the hotkey will not work, but all other features function normally.
 
-> 📝 The system tray icon is not available on macOS in this version.  
-> All other features (clipboard recording, search, hotkey, history) work normally.
+> 📝 **System tray icon** is not available on macOS in this version.  
+> Use the hotkey or click the Dock icon to show the window.
+
+> 🌏 CJK (Chinese/Japanese/Korean) fonts are embedded in the binary — no system font installation needed.
 
 ### Linux
 
@@ -162,8 +178,8 @@ cargo build --release
 
 ```
 src/
-├── main.rs      # Entry point, hotkey registration, CJK font loading
-├── app.rs       # GUI (egui): search, render, actions, pause toggle
+├── main.rs      # Entry point, hotkey registration, system tray, CJK font
+├── app.rs       # GUI (egui): search, render, keyboard nav, pause toggle
 ├── store.rs     # Data model, persistence, debounced disk writes
 └── monitor.rs   # Background clipboard polling thread
 ```
@@ -173,6 +189,7 @@ src/
 | GUI framework | `egui` / `eframe` | Immediate-mode, native, 60fps, no Electron |
 | Clipboard access | `arboard` | Cross-platform clipboard read/write |
 | Global hotkey | `global-hotkey` | System-wide `Ctrl+Shift+V` registration |
+| System tray | `tray-icon` | Windows/Linux tray icon with menu |
 | Serialization | `serde_json` | Persist history to JSON |
 | Timestamps | `chrono` | Entry timestamps and time grouping |
 
@@ -183,8 +200,10 @@ src/
 - **200ms poll interval** — clipboard changes are captured within 200ms
 - **FNV-1a hash** — image change detection without copying bytes
 - **Debounced writes** — disk I/O batched to at most once per 2 seconds
-- **Pre-computed fields** — `preview`, `stats`, and lowercase search index computed once at capture time, never recalculated during rendering
-- **Hidden = idle** — when the window is hidden, the UI thread polls at 200ms instead of 60fps, near-zero CPU usage
+- **Pre-computed fields** — `preview`, `stats`, char count, and lowercase search index computed once at capture time
+- **O(1) deduplication** — `HashSet` lookup instead of linear scan
+- **Virtual scroll** — log renders only visible rows regardless of entry count
+- **Minimized = idle** — when minimized, UI polls at 200ms instead of 60fps, near-zero CPU usage
 
 ---
 
