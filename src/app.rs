@@ -12,6 +12,7 @@ pub struct App {
     just_shown: bool,
     query: String,
     query_lc: String,
+    last_query_for_lc: String,  // tracks last query used to build query_lc
     clipboard: Clipboard,
     img_cache: HashMap<u64, TextureHandle>,
     pub hotkey_triggered: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -36,6 +37,7 @@ impl App {
             just_shown: true,
             query: String::new(),
             query_lc: String::new(),
+            last_query_for_lc: String::new(),
             clipboard: Clipboard::new().expect("clipboard init failed"),
             img_cache: HashMap::new(),
             hotkey_triggered,
@@ -89,6 +91,7 @@ impl App {
         self.visible = false;
         self.query.clear();
         self.query_lc.clear();
+        self.last_query_for_lc.clear();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 }
@@ -136,12 +139,10 @@ impl eframe::App for App {
         }
 
         // Update query_lc only when query actually changes
-        if self.query != self.query_lc.as_str() {
-            let new_lc = self.query.to_lowercase();
-            if new_lc != self.query_lc {
-                self.query_lc = new_lc;
-                self.selected_idx = None; // reset selection when search changes
-            }
+        if self.query != self.last_query_for_lc {
+            self.last_query_for_lc = self.query.clone();
+            self.query_lc = self.query.to_lowercase();
+            self.selected_idx = None;
         }
 
         // Refresh cached status string
@@ -157,6 +158,17 @@ impl eframe::App for App {
                         .desired_width(f32::INFINITY),
                 );
                 if self.just_shown { resp.request_focus(); }
+
+                // Clear button — only show when query is non-empty
+                if !self.query.is_empty() {
+                    if ui.small_button("✕").on_hover_text("清空搜索").clicked() {
+                        self.query.clear();
+                        self.query_lc.clear();
+                        self.last_query_for_lc.clear();
+                        self.selected_idx = None;
+                        resp.request_focus();
+                    }
+                }
 
                 // Pause toggle
                 let pause_label = if self.paused { "▶" } else { "⏸" };
@@ -359,8 +371,9 @@ fn render_entry(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 // Show sequence number (1-9) as keyboard shortcut hint
-                if seq <= 9 {
-                    ui.label(RichText::new(format!("{}", seq)).small().color(
+                const SEQ_LABELS: [&str; 9] = ["1","2","3","4","5","6","7","8","9"];
+                if seq >= 1 && seq <= 9 {
+                    ui.label(RichText::new(SEQ_LABELS[seq - 1]).small().color(
                         if selected { Color32::WHITE } else { Color32::from_rgb(80, 80, 80) }
                     ));
                 }
@@ -385,13 +398,9 @@ fn render_entry(
                             .truncate(),
                     );
                     if resp.clicked() { action = Some(Action::Copy(entry.id)); }
-                    // Reuse char count from stats to avoid re-counting
-                    let is_long = entry.stats.contains('行') ||
-                        entry.stats.trim_end_matches(" 字")
-                            .parse::<usize>().unwrap_or(0) > 2000;
                     let resp = resp.on_hover_ui(|ui| {
                         ui.set_max_width(420.0);
-                        if !is_long {
+                        if entry.char_count <= 2000 {
                             ui.label(RichText::new(text.trim()).monospace().size(12.0));
                         } else {
                             let preview: String = text.chars().take(2000).collect();

@@ -18,7 +18,8 @@ pub struct ClipEntry {
     pub pinned: bool,
     pub preview: String,
     pub stats: String,
-    pub time_str: String,   // pre-formatted "HH:MM" or "MM/DD HH:MM"
+    pub char_count: usize,  // pre-computed, used for hover truncation check
+    pub time_str: String,
     #[serde(skip)]
     pub text_lc: String,
 }
@@ -26,14 +27,14 @@ pub struct ClipEntry {
 impl ClipEntry {
     pub fn new(id: u64, content: ClipContent) -> Self {
         let preview = make_preview(&content);
-        let stats = make_stats(&content);
+        let (stats, char_count) = make_stats(&content);
         let text_lc = match &content {
             ClipContent::Text(t) => t.to_lowercase(),
             ClipContent::Image { .. } => String::new(),
         };
         let now = Local::now();
         let time_str = now.format("%H:%M").to_string();
-        Self { id, content, time: now, pinned: false, preview, stats, time_str, text_lc }
+        Self { id, content, time: now, pinned: false, preview, stats, char_count, time_str, text_lc }
     }
 
     /// Rebuild time_str after loading from disk (date may differ from today)
@@ -58,15 +59,24 @@ fn make_preview(content: &ClipContent) -> String {
     }
 }
 
-fn make_stats(content: &ClipContent) -> String {
+fn make_stats(content: &ClipContent) -> (String, usize) {
     match content {
         ClipContent::Text(s) => {
-            let chars = s.chars().count();
-            let lines = s.lines().count();
-            if lines > 1 { format!("{} 行 {} 字", lines, chars) }
-            else { format!("{} 字", chars) }
+            // Single pass: count chars and lines simultaneously
+            let mut chars = 0usize;
+            let mut lines = 1usize;
+            for ch in s.trim().chars() {
+                chars += 1;
+                if ch == '\n' { lines += 1; }
+            }
+            let stats = if lines > 1 {
+                format!("{} 行 {} 字", lines, chars)
+            } else {
+                format!("{} 字", chars)
+            };
+            (stats, chars)
         }
-        ClipContent::Image { width, height, .. } => format!("{}×{}", width, height),
+        ClipContent::Image { width, height, .. } => (format!("{}×{}", width, height), 0),
     }
 }
 
