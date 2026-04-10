@@ -5,36 +5,37 @@ use egui::{Color32, RichText, ScrollArea, TextEdit, TextureHandle, Vec2};
 use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
 
+pub enum TrayMsg { Show, Quit }
+
 pub struct App {
     pub store: Store,
     pub rx: Receiver<ClipContent>,
-    visible: bool,
+    pub tray_rx: Receiver<TrayMsg>,
     just_shown: bool,
-    hide_next_frame: bool,  // delay hide by one frame so clipboard write completes
+    hide_next_frame: bool,
     query: String,
     query_lc: String,
-    last_query_for_lc: String,  // tracks last query used to build query_lc
+    last_query_for_lc: String,
     clipboard: Clipboard,
     img_cache: HashMap<u64, TextureHandle>,
     pub hotkey_triggered: std::sync::Arc<std::sync::atomic::AtomicBool>,
     paused: bool,
-    last_paused: bool,      // previous paused state for change detection
+    last_paused: bool,
     status_str: String,
     status_count: usize,
-    selected_idx: Option<usize>, // keyboard navigation index into filtered list
+    selected_idx: Option<usize>,
 }
 
 impl App {
     pub fn new(
         rx: Receiver<ClipContent>,
         hotkey_triggered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        tray_rx: Receiver<TrayMsg>,
     ) -> Self {
         let store = Store::load();
         let count = store.entries.len();
         Self {
-            store,
-            rx,
-            visible: true,
+            store, rx, tray_rx,
             just_shown: true,
             hide_next_frame: false,
             query: String::new(),
@@ -53,15 +54,14 @@ impl App {
 
     fn make_status(count: usize, paused: bool) -> String {
         if paused {
-            format!("{} 条记录  •  已暂停  •  Ctrl+Shift+V 呼出  •  Esc 隐藏", count)
+            format!("{} 条记录  •  已暂停  •  Esc 最小化", count)
         } else {
-            format!("{} 条记录  •  Ctrl+Shift+V 呼出  •  Esc 隐藏", count)
+            format!("{} 条记录  •  Ctrl+Shift+V 呼出  •  Esc 最小化", count)
         }
     }
 
     fn refresh_status(&mut self) {
         let count = self.store.entries.len();
-        // Compare fields directly — no string search
         if count != self.status_count || self.paused != self.last_paused {
             self.status_count = count;
             self.last_paused = self.paused;
@@ -83,47 +83,56 @@ impl App {
     }
 
     fn show(&mut self, ctx: &egui::Context) {
-        self.visible = true;
         self.just_shown = true;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
-    fn hide(&mut self, ctx: &egui::Context) {
-        self.visible = false;
+    fn minimize(&mut self, ctx: &egui::Context) {
         self.query.clear();
         self.query_lc.clear();
         self.last_query_for_lc.clear();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
     }
 }
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Flush any pending writes before process exits
         self.store.flush_now();
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Delayed hide — execute one frame after clipboard write
+        // Handle tray menu events
+        while let Ok(msg) = self.tray_rx.try_recv() {
+            match msg {
+                TrayMsg::Show => self.show(ctx),
+                TrayMsg::Quit => {
+                    self.store.flush_now();
+                    std::process::exit(0);
+                }
+            }
+        }
+
+        // Delayed minimize — one frame after clipboard write
         if self.hide_next_frame {
             self.hide_next_frame = false;
-            self.hide(ctx);
+            self.minimize(ctx);
             return;
         }
-        // Intercept window close → hide instead of exit
+
+        // Close button → minimize to taskbar
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.hide(ctx);
+            self.minimize(ctx);
             return;
         }
 
-        // Toggle visibility via hotkey
+        // Hotkey toggle
         if self.hotkey_triggered.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            if self.visible { self.hide(ctx); } else { self.show(ctx); }
+            self.show(ctx);
         }
 
-        // Drain new clipboard entries (skip if paused)
+        // Drain new clipboard entries
         let mut got_new = false;
         while let Ok(content) = self.rx.try_recv() {
             if !self.paused {
@@ -131,29 +140,21 @@ impl eframe::App for App {
                 got_new = true;
             }
         }
-        if got_new && self.visible { ctx.request_repaint(); }
+        if got_new { ctx.request_repaint(); }
 
-        // Flush dirty store to disk (debounced, max once per 2s)
         self.store.flush_if_needed();
 
-        if !self.visible {
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
-            return;
-        }
-
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.hide(ctx);
+            self.minimize(ctx);
             return;
         }
 
-        // Update query_lc only when query actually changes
         if self.query != self.last_query_for_lc {
             self.last_query_for_lc = self.query.clone();
             self.query_lc = self.query.to_lowercase();
             self.selected_idx = None;
         }
 
-        // Refresh cached status string
         self.refresh_status();
 
         egui::TopBottomPanel::top("search_bar").show(ctx, |ui| {
@@ -167,7 +168,6 @@ impl eframe::App for App {
                 );
                 if self.just_shown { resp.request_focus(); }
 
-                // Clear button — only show when query is non-empty
                 if !self.query.is_empty() {
                     if ui.small_button("✕").on_hover_text("清空搜索").clicked() {
                         self.query.clear();
@@ -178,7 +178,6 @@ impl eframe::App for App {
                     }
                 }
 
-                // Pause toggle
                 let pause_label = if self.paused { "▶" } else { "⏸" };
                 if ui.small_button(pause_label)
                     .on_hover_text(if self.paused { "恢复记录" } else { "暂停记录" })
@@ -202,7 +201,6 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Build filtered list once — pre-allocate capacity
             let cap = self.store.entries.len();
             let mut pinned: Vec<&ClipEntry> = Vec::with_capacity(cap / 4);
             let mut recent: Vec<&ClipEntry> = Vec::with_capacity(cap);
@@ -218,17 +216,15 @@ impl eframe::App for App {
                 if e.pinned { pinned.push(e); } else { recent.push(e); }
             }
 
-            // Keyboard navigation + number key shortcuts
             let total = pinned.len() + recent.len();
             if total > 0 {
                 let down  = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
                 let up    = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
                 let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
 
-                // Number keys 1-9: instantly copy nth visible entry
                 let num_pressed = ctx.input(|i| {
                     for (k, n) in [
-                        (egui::Key::Num1,1),(egui::Key::Num2,2),(egui::Key::Num3,3),
+                        (egui::Key::Num1,1usize),(egui::Key::Num2,2),(egui::Key::Num3,3),
                         (egui::Key::Num4,4),(egui::Key::Num5,5),(egui::Key::Num6,6),
                         (egui::Key::Num7,7),(egui::Key::Num8,8),(egui::Key::Num9,9),
                     ] {
@@ -236,14 +232,12 @@ impl eframe::App for App {
                     }
                     None
                 });
+
                 if let Some(n) = num_pressed {
                     let idx = n - 1;
-                    let entry_ref = if idx < pinned.len() {
-                        pinned.get(idx).copied()
-                    } else {
-                        recent.get(idx - pinned.len()).copied()
-                    };
-                    if let Some(e) = entry_ref {
+                    let e = if idx < pinned.len() { pinned.get(idx).copied() }
+                            else { recent.get(idx - pinned.len()).copied() };
+                    if let Some(e) = e {
                         let id = e.id;
                         if let Some(entry) = self.store.entries.iter().find(|e| e.id == id).cloned() {
                             self.copy_entry(&entry);
@@ -258,20 +252,14 @@ impl eframe::App for App {
                 if down || up {
                     self.selected_idx = Some(match self.selected_idx {
                         None => 0,
-                        Some(i) => {
-                            if down { (i + 1).min(total - 1) }
-                            else { i.saturating_sub(1) }
-                        }
+                        Some(i) => if down { (i + 1).min(total - 1) } else { i.saturating_sub(1) }
                     });
                 }
                 if enter {
                     if let Some(idx) = self.selected_idx {
-                        let entry_ref = if idx < pinned.len() {
-                            pinned.get(idx).copied()
-                        } else {
-                            recent.get(idx - pinned.len()).copied()
-                        };
-                        if let Some(e) = entry_ref {
+                        let e = if idx < pinned.len() { pinned.get(idx).copied() }
+                                else { recent.get(idx - pinned.len()).copied() };
+                        if let Some(e) = e {
                             let id = e.id;
                             if let Some(entry) = self.store.entries.iter().find(|e| e.id == id).cloned() {
                                 self.copy_entry(&entry);
@@ -337,7 +325,7 @@ impl eframe::App for App {
                         if let Some(entry) = self.store.entries.iter().find(|e| e.id == id).cloned() {
                             self.copy_entry(&entry);
                             self.store.push(entry.content);
-                            // Window stays open — user can continue browsing
+                            // Window stays open after click-to-copy
                         }
                     }
                     Action::Pin(id) => { self.store.toggle_pin(id); }
@@ -361,24 +349,20 @@ fn render_entry(
     ctx: &egui::Context,
     img_cache: &mut HashMap<u64, TextureHandle>,
     selected: bool,
-    seq: usize,  // 1-based sequence number for keyboard shortcut hint
+    seq: usize,
 ) -> Option<Action> {
     let mut action = None;
 
-    let bg = if selected {
-        Color32::from_rgb(50, 70, 100)
-    } else if entry.pinned {
-        Color32::from_rgb(40, 40, 20)
-    } else {
-        Color32::from_rgb(28, 28, 28)
-    };
+    let bg = if selected { Color32::from_rgb(50, 70, 100) }
+             else if entry.pinned { Color32::from_rgb(40, 40, 20) }
+             else { Color32::from_rgb(28, 28, 28) };
+
     egui::Frame::new()
         .fill(bg)
         .corner_radius(6.0)
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                // Show sequence number (1-9) as keyboard shortcut hint
                 const SEQ_LABELS: [&str; 9] = ["1","2","3","4","5","6","7","8","9"];
                 if seq >= 1 && seq <= 9 {
                     ui.label(RichText::new(SEQ_LABELS[seq - 1]).small().color(
@@ -417,17 +401,14 @@ fn render_entry(
                     });
                     resp.context_menu(|ui| {
                         if ui.button("📋  复制").clicked() {
-                            action = Some(Action::Copy(entry.id));
-                            ui.close_menu();
+                            action = Some(Action::Copy(entry.id)); ui.close_menu();
                         }
                         if ui.button("📌  固定 / 取消固定").clicked() {
-                            action = Some(Action::Pin(entry.id));
-                            ui.close_menu();
+                            action = Some(Action::Pin(entry.id)); ui.close_menu();
                         }
                         ui.separator();
                         if ui.button("🗑  删除").clicked() {
-                            action = Some(Action::Delete(entry.id));
-                            ui.close_menu();
+                            action = Some(Action::Delete(entry.id)); ui.close_menu();
                         }
                     });
                 }
