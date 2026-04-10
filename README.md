@@ -3,7 +3,7 @@
 > **A blazing-fast clipboard history manager built with Rust — silently records everything you copy, instantly recalled with a hotkey.**
 
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
-![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Version](https://img.shields.io/badge/version-0.1.0-brightgreen)
 
@@ -18,7 +18,7 @@ The Windows clipboard only holds one item. Every time you copy something new, th
 - 📌 **Pin important items** — pinned entries never get pushed out by new copies
 - 🖼 **Image support** — screenshots and copied images are captured and previewed
 - 💾 **Persistent history** — survives restarts, up to 500 entries saved to disk
-- 📦 **Zero dependencies** — single `.exe`, no installation required
+- 📦 **Zero dependencies** — single binary, no installation required
 
 ---
 
@@ -52,7 +52,7 @@ The Windows clipboard only holds one item. Every time you copy something new, th
 - **Auto-focus search** — search box is ready to type the moment the window appears
 
 ### Data
-- **Persistent storage** — history saved to `%LOCALAPPDATA%\clip-vault\history.json`
+- **Persistent storage** — history saved to `%LOCALAPPDATA%\clip-vault\history.json` (Windows) or `~/Library/Application Support/clip-vault/history.json` (macOS)
 - **Debounced writes** — disk writes are batched (max once per 2 seconds) to avoid I/O thrash
 - **Safe shutdown** — pending writes are flushed immediately on exit, no data loss
 - **Images not persisted** — image bytes are kept in memory only (too large for JSON)
@@ -89,13 +89,58 @@ The Windows clipboard only holds one item. Every time you copy something new, th
 
 ## 📥 Download & Run
 
+### Windows
 1. Go to [Releases](../../releases)
 2. Download `clip-vault.exe`
 3. Double-click to start — it runs silently in the background
 4. Press `Ctrl+Shift+V` to open the history window
 
-> ✅ No .NET, no Java, no Python, no Visual C++ Redistributable required.
+> ✅ No .NET, no Java, no Python, no Visual C++ Redistributable required.  
 > Works on Windows 10 and above.
+
+### macOS
+
+macOS does not allow running unsigned binaries by default. Build from source:
+
+```bash
+# 1. Install Rust (if not already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
+# 2. Clone and build
+git clone https://github.com/1716775457damn/clip-vault.git
+cd clip-vault
+cargo build --release
+
+# 3. Run
+./target/release/clip-vault
+```
+
+**Optional: package as a `.app` bundle**
+
+```bash
+cargo install cargo-bundle
+cargo bundle --release
+open "target/release/bundle/osx/Clip Vault.app"
+```
+
+> ℹ️ On first launch macOS may show a security warning.  
+> Go to **System Settings → Privacy & Security** and click **Open Anyway**.
+
+> ⚠️ The global hotkey (`Ctrl+Shift+V`) requires **Accessibility permission** on macOS.  
+> Go to **System Settings → Privacy & Security → Accessibility** and add Clip Vault.
+
+> 📝 The system tray icon is not available on macOS in this version.  
+> All other features (clipboard recording, search, hotkey, history) work normally.
+
+### Linux
+
+```bash
+git clone https://github.com/1716775457damn/clip-vault.git
+cd clip-vault
+cargo build --release
+./target/release/clip-vault
+```
 
 ---
 
@@ -107,7 +152,8 @@ Requires [Rust](https://rustup.rs/) (stable toolchain).
 git clone https://github.com/1716775457damn/clip-vault.git
 cd clip-vault
 cargo build --release
-# Binary: target/release/clip-vault.exe
+# Windows: target/release/clip-vault.exe
+# macOS/Linux: target/release/clip-vault
 ```
 
 ---
@@ -144,7 +190,8 @@ src/
 
 ## 🗺️ Roadmap
 
-- [ ] System tray icon
+- [x] System tray icon (Windows)
+- [ ] System tray icon (macOS)
 - [ ] Configurable hotkey
 - [ ] Export history to file
 - [ ] Max history size setting
