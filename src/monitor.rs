@@ -19,7 +19,8 @@ pub fn start(tx: Sender<ClipContent>) {
 
             if let Ok(text) = clipboard.get_text() {
                 let text = text.trim().to_string();
-                if !text.is_empty() && text != last_text {
+                // Compare length first — cheap short-circuit for long strings
+                if !text.is_empty() && (text.len() != last_text.len() || text != last_text) {
                     last_text = text.clone();
                     let _ = tx.send(ClipContent::Text(text));
                 }

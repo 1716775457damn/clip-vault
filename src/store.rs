@@ -103,14 +103,15 @@ impl Store {
     }
 
     pub fn push(&mut self, content: ClipContent) {
-        // O(1) dedup check via HashSet
+        // O(1) check, then targeted remove by id instead of full retain scan
         if let ClipContent::Text(ref t) = content {
             if self.text_set.contains(t.as_str()) {
-                // Remove existing entry so it moves to top
-                self.entries.retain(|e| match &e.content {
-                    ClipContent::Text(existing) => existing != t,
-                    _ => true,
-                });
+                if let Some(pos) = self.entries.iter().position(|e| match &e.content {
+                    ClipContent::Text(existing) => existing == t,
+                    _ => false,
+                }) {
+                    self.entries.remove(pos);
+                }
                 self.text_set.remove(t.as_str());
             }
         }
@@ -174,12 +175,15 @@ impl Store {
     /// Force immediate save (call on app exit)
     pub fn flush_now(&mut self) {
         if !self.dirty { return; }
-        let text_only: Vec<&ClipEntry> = self.entries.iter()
-            .filter(|e| matches!(e.content, ClipContent::Text(_)))
-            .collect();
-        if let Ok(json) = serde_json::to_string(&text_only) {
-            let _ = std::fs::create_dir_all(self.path.parent().unwrap());
-            let _ = std::fs::write(&self.path, &json);
+        let path = &self.path;
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        // Write directly to file via writer — avoids intermediate String allocation
+        if let Ok(file) = std::fs::File::create(path) {
+            let text_only = self.entries.iter()
+                .filter(|e| matches!(e.content, ClipContent::Text(_)));
+            // Collect refs for serde — serde_json::to_writer needs a slice
+            let refs: Vec<&ClipEntry> = text_only.collect();
+            let _ = serde_json::to_writer(std::io::BufWriter::new(file), &refs);
         }
         self.dirty = false;
         self.last_save = Instant::now();

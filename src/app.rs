@@ -135,9 +135,14 @@ impl eframe::App for App {
             return;
         }
 
-        // Update query_lc only when query changes (not every frame)
-        let new_lc = self.query.to_lowercase();
-        if new_lc != self.query_lc { self.query_lc = new_lc; }
+        // Update query_lc only when query actually changes
+        if self.query != self.query_lc.as_str() {
+            let new_lc = self.query.to_lowercase();
+            if new_lc != self.query_lc {
+                self.query_lc = new_lc;
+                self.selected_idx = None; // reset selection when search changes
+            }
+        }
 
         // Refresh cached status string
         self.refresh_status();
@@ -193,12 +198,43 @@ impl eframe::App for App {
                 if e.pinned { pinned.push(e); } else { recent.push(e); }
             }
 
-            // Keyboard navigation on the combined list
+            // Keyboard navigation + number key shortcuts
             let total = pinned.len() + recent.len();
             if total > 0 {
-                let down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
-                let up   = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
+                let down  = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
+                let up    = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
                 let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+
+                // Number keys 1-9: instantly copy nth visible entry
+                let num_pressed = ctx.input(|i| {
+                    for (k, n) in [
+                        (egui::Key::Num1,1),(egui::Key::Num2,2),(egui::Key::Num3,3),
+                        (egui::Key::Num4,4),(egui::Key::Num5,5),(egui::Key::Num6,6),
+                        (egui::Key::Num7,7),(egui::Key::Num8,8),(egui::Key::Num9,9),
+                    ] {
+                        if i.key_pressed(k) { return Some(n); }
+                    }
+                    None
+                });
+                if let Some(n) = num_pressed {
+                    let idx = n - 1;
+                    let entry_ref = if idx < pinned.len() {
+                        pinned.get(idx).copied()
+                    } else {
+                        recent.get(idx - pinned.len()).copied()
+                    };
+                    if let Some(e) = entry_ref {
+                        let id = e.id;
+                        if let Some(entry) = self.store.entries.iter().find(|e| e.id == id).cloned() {
+                            self.copy_entry(&entry);
+                            self.store.push(entry.content);
+                            self.selected_idx = None;
+                            self.hide(ctx);
+                            return;
+                        }
+                    }
+                }
+
                 if down || up {
                     self.selected_idx = Some(match self.selected_idx {
                         None => 0,
@@ -210,12 +246,12 @@ impl eframe::App for App {
                 }
                 if enter {
                     if let Some(idx) = self.selected_idx {
-                        let entry = if idx < pinned.len() {
+                        let entry_ref = if idx < pinned.len() {
                             pinned.get(idx).copied()
                         } else {
                             recent.get(idx - pinned.len()).copied()
                         };
-                        if let Some(e) = entry {
+                        if let Some(e) = entry_ref {
                             let id = e.id;
                             if let Some(entry) = self.store.entries.iter().find(|e| e.id == id).cloned() {
                                 self.copy_entry(&entry);
@@ -238,14 +274,13 @@ impl eframe::App for App {
                     ui.label(RichText::new("📌 已固定").small().color(Color32::GOLD));
                     for (i, e) in pinned.iter().enumerate() {
                         let selected = self.selected_idx == Some(i);
-                        if let Some(a) = render_entry(ui, e, ctx, &mut self.img_cache, selected) {
+                        if let Some(a) = render_entry(ui, e, ctx, &mut self.img_cache, selected, i + 1) {
                             action = Some(a);
                         }
                     }
                     ui.separator();
                 }
 
-                // Call Local::now() once per frame, not per entry
                 let today = chrono::Local::now().date_naive();
                 let yesterday = today.pred_opt().unwrap_or(today);
                 let mut last_group = "";
@@ -260,8 +295,9 @@ impl eframe::App for App {
                         ui.label(RichText::new(group).small().color(Color32::DARK_GRAY));
                         last_group = group;
                     }
-                    let selected = self.selected_idx == Some(pinned.len() + i);
-                    if let Some(a) = render_entry(ui, e, ctx, &mut self.img_cache, selected) {
+                    let abs_idx = pinned.len() + i;
+                    let selected = self.selected_idx == Some(abs_idx);
+                    if let Some(a) = render_entry(ui, e, ctx, &mut self.img_cache, selected, abs_idx + 1) {
                         action = Some(a);
                     }
                 }
@@ -305,11 +341,12 @@ fn render_entry(
     ctx: &egui::Context,
     img_cache: &mut HashMap<u64, TextureHandle>,
     selected: bool,
+    seq: usize,  // 1-based sequence number for keyboard shortcut hint
 ) -> Option<Action> {
     let mut action = None;
 
     let bg = if selected {
-        Color32::from_rgb(50, 70, 100)   // blue highlight for keyboard selection
+        Color32::from_rgb(50, 70, 100)
     } else if entry.pinned {
         Color32::from_rgb(40, 40, 20)
     } else {
@@ -321,7 +358,12 @@ fn render_entry(
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                // Use pre-computed time_str — no format() call per frame
+                // Show sequence number (1-9) as keyboard shortcut hint
+                if seq <= 9 {
+                    ui.label(RichText::new(format!("{}", seq)).small().color(
+                        if selected { Color32::WHITE } else { Color32::from_rgb(80, 80, 80) }
+                    ));
+                }
                 ui.label(RichText::new(&entry.time_str).small().color(Color32::DARK_GRAY));
                 ui.label(RichText::new(&entry.stats).small().color(Color32::DARK_GRAY));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -343,11 +385,13 @@ fn render_entry(
                             .truncate(),
                     );
                     if resp.clicked() { action = Some(Action::Copy(entry.id)); }
-                    // Compute char count once for hover
-                    let char_count = text.chars().count();
+                    // Reuse char count from stats to avoid re-counting
+                    let is_long = entry.stats.contains('行') ||
+                        entry.stats.trim_end_matches(" 字")
+                            .parse::<usize>().unwrap_or(0) > 2000;
                     let resp = resp.on_hover_ui(|ui| {
                         ui.set_max_width(420.0);
-                        if char_count <= 2000 {
+                        if !is_long {
                             ui.label(RichText::new(text.trim()).monospace().size(12.0));
                         } else {
                             let preview: String = text.chars().take(2000).collect();
