@@ -18,6 +18,7 @@ pub struct ClipEntry {
     pub pinned: bool,
     pub preview: String,
     pub stats: String,
+    pub time_str: String,   // pre-formatted "HH:MM" or "MM/DD HH:MM"
     #[serde(skip)]
     pub text_lc: String,
 }
@@ -30,7 +31,19 @@ impl ClipEntry {
             ClipContent::Text(t) => t.to_lowercase(),
             ClipContent::Image { .. } => String::new(),
         };
-        Self { id, content, time: Local::now(), pinned: false, preview, stats, text_lc }
+        let now = Local::now();
+        let time_str = now.format("%H:%M").to_string();
+        Self { id, content, time: now, pinned: false, preview, stats, time_str, text_lc }
+    }
+
+    /// Rebuild time_str after loading from disk (date may differ from today)
+    pub fn rebuild_time_str(&mut self, today: chrono::NaiveDate) {
+        let date = self.time.date_naive();
+        self.time_str = if date == today {
+            self.time.format("%H:%M").to_string()
+        } else {
+            self.time.format("%m/%d %H:%M").to_string()
+        };
     }
 }
 
@@ -63,6 +76,8 @@ pub struct Store {
     next_id: u64,
     dirty: bool,
     last_save: Instant,
+    /// HashSet of text content for O(1) dedup check
+    text_set: std::collections::HashSet<String>,
 }
 
 impl Store {
@@ -73,36 +88,58 @@ impl Store {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         entries.retain(|e| matches!(&e.content, ClipContent::Text(_)));
+        let today = Local::now().date_naive();
         for e in &mut entries {
             if let ClipContent::Text(t) = &e.content {
                 e.text_lc = t.to_lowercase();
             }
+            e.rebuild_time_str(today);
         }
+        let text_set: std::collections::HashSet<String> = entries.iter()
+            .filter_map(|e| if let ClipContent::Text(t) = &e.content { Some(t.clone()) } else { None })
+            .collect();
         let next_id = entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
-        Self { entries, path, next_id, dirty: false, last_save: Instant::now() }
+        Self { entries, path, next_id, dirty: false, last_save: Instant::now(), text_set }
     }
 
     pub fn push(&mut self, content: ClipContent) {
+        // O(1) dedup check via HashSet
         if let ClipContent::Text(ref t) = content {
-            self.entries.retain(|e| match &e.content {
-                ClipContent::Text(existing) => existing != t,
-                _ => true,
-            });
+            if self.text_set.contains(t.as_str()) {
+                // Remove existing entry so it moves to top
+                self.entries.retain(|e| match &e.content {
+                    ClipContent::Text(existing) => existing != t,
+                    _ => true,
+                });
+                self.text_set.remove(t.as_str());
+            }
         }
         let entry = ClipEntry::new(self.next_id, content);
         self.next_id += 1;
+        if let ClipContent::Text(ref t) = entry.content {
+            self.text_set.insert(t.clone());
+        }
+        // Insert after pinned entries
         let first_unpinned = self.entries.iter().position(|e| !e.pinned).unwrap_or(self.entries.len());
         self.entries.insert(first_unpinned, entry);
+        // Trim unpinned to 500, also remove from text_set
         let mut unpinned = 0usize;
         self.entries.retain(|e| {
             if e.pinned { return true; }
             unpinned += 1;
-            unpinned <= 500
+            if unpinned > 500 {
+                if let ClipContent::Text(t) = &e.content { self.text_set.remove(t.as_str()); }
+                return false;
+            }
+            true
         });
         self.mark_dirty();
     }
 
     pub fn remove(&mut self, id: u64) {
+        if let Some(e) = self.entries.iter().find(|e| e.id == id) {
+            if let ClipContent::Text(t) = &e.content { self.text_set.remove(t.as_str()); }
+        }
         self.entries.retain(|e| e.id != id);
         self.mark_dirty();
     }
@@ -115,7 +152,11 @@ impl Store {
     }
 
     pub fn clear_unpinned(&mut self) {
-        self.entries.retain(|e| e.pinned);
+        self.entries.retain(|e| {
+            if e.pinned { return true; }
+            if let ClipContent::Text(t) = &e.content { self.text_set.remove(t.as_str()); }
+            false
+        });
         self.mark_dirty();
     }
 

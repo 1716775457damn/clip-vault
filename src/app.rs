@@ -15,9 +15,11 @@ pub struct App {
     clipboard: Clipboard,
     img_cache: HashMap<u64, TextureHandle>,
     pub hotkey_triggered: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    paused: bool,           // when true, ignore incoming clipboard events
-    status_str: String,     // cached status bar string
-    status_count: usize,    // last count used to build status_str
+    paused: bool,
+    last_paused: bool,      // previous paused state for change detection
+    status_str: String,
+    status_count: usize,
+    selected_idx: Option<usize>, // keyboard navigation index into filtered list
 }
 
 impl App {
@@ -38,8 +40,10 @@ impl App {
             img_cache: HashMap::new(),
             hotkey_triggered,
             paused: false,
+            last_paused: false,
             status_str: Self::make_status(count, false),
             status_count: count,
+            selected_idx: None,
         }
     }
 
@@ -53,8 +57,10 @@ impl App {
 
     fn refresh_status(&mut self) {
         let count = self.store.entries.len();
-        if count != self.status_count || self.paused != (self.status_str.contains("已暂停")) {
+        // Compare fields directly — no string search
+        if count != self.status_count || self.paused != self.last_paused {
             self.status_count = count;
+            self.last_paused = self.paused;
             self.status_str = Self::make_status(count, self.paused);
         }
     }
@@ -171,8 +177,10 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let mut pinned: Vec<&ClipEntry> = Vec::new();
-            let mut recent: Vec<&ClipEntry> = Vec::new();
+            // Build filtered list once — pre-allocate capacity
+            let cap = self.store.entries.len();
+            let mut pinned: Vec<&ClipEntry> = Vec::with_capacity(cap / 4);
+            let mut recent: Vec<&ClipEntry> = Vec::with_capacity(cap);
             for e in &self.store.entries {
                 if !self.query_lc.is_empty() {
                     match &e.content {
@@ -185,25 +193,64 @@ impl eframe::App for App {
                 if e.pinned { pinned.push(e); } else { recent.push(e); }
             }
 
+            // Keyboard navigation on the combined list
+            let total = pinned.len() + recent.len();
+            if total > 0 {
+                let down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
+                let up   = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
+                let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                if down || up {
+                    self.selected_idx = Some(match self.selected_idx {
+                        None => 0,
+                        Some(i) => {
+                            if down { (i + 1).min(total - 1) }
+                            else { i.saturating_sub(1) }
+                        }
+                    });
+                }
+                if enter {
+                    if let Some(idx) = self.selected_idx {
+                        let entry = if idx < pinned.len() {
+                            pinned.get(idx).copied()
+                        } else {
+                            recent.get(idx - pinned.len()).copied()
+                        };
+                        if let Some(e) = entry {
+                            let id = e.id;
+                            if let Some(entry) = self.store.entries.iter().find(|e| e.id == id).cloned() {
+                                self.copy_entry(&entry);
+                                self.store.push(entry.content);
+                                self.selected_idx = None;
+                                self.hide(ctx);
+                                return;
+                            }
+                        }
+                    }
+                }
+            } else {
+                self.selected_idx = None;
+            }
+
             let mut action: Option<Action> = None;
 
             ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 if !pinned.is_empty() {
                     ui.label(RichText::new("📌 已固定").small().color(Color32::GOLD));
-                    for e in &pinned {
-                        if let Some(a) = render_entry(ui, e, ctx, &mut self.img_cache) {
+                    for (i, e) in pinned.iter().enumerate() {
+                        let selected = self.selected_idx == Some(i);
+                        if let Some(a) = render_entry(ui, e, ctx, &mut self.img_cache, selected) {
                             action = Some(a);
                         }
                     }
                     ui.separator();
                 }
 
-                let now = chrono::Local::now();
-                let today = now.date_naive();
+                // Call Local::now() once per frame, not per entry
+                let today = chrono::Local::now().date_naive();
                 let yesterday = today.pred_opt().unwrap_or(today);
                 let mut last_group = "";
 
-                for e in &recent {
+                for (i, e) in recent.iter().enumerate() {
                     let date = e.time.date_naive();
                     let group = if date == today { "今天" }
                         else if date == yesterday { "昨天" }
@@ -213,7 +260,8 @@ impl eframe::App for App {
                         ui.label(RichText::new(group).small().color(Color32::DARK_GRAY));
                         last_group = group;
                     }
-                    if let Some(a) = render_entry(ui, e, ctx, &mut self.img_cache) {
+                    let selected = self.selected_idx == Some(pinned.len() + i);
+                    if let Some(a) = render_entry(ui, e, ctx, &mut self.img_cache, selected) {
                         action = Some(a);
                     }
                 }
@@ -256,17 +304,25 @@ fn render_entry(
     entry: &ClipEntry,
     ctx: &egui::Context,
     img_cache: &mut HashMap<u64, TextureHandle>,
+    selected: bool,
 ) -> Option<Action> {
     let mut action = None;
 
-    let bg = if entry.pinned { Color32::from_rgb(40, 40, 20) } else { Color32::from_rgb(28, 28, 28) };
+    let bg = if selected {
+        Color32::from_rgb(50, 70, 100)   // blue highlight for keyboard selection
+    } else if entry.pinned {
+        Color32::from_rgb(40, 40, 20)
+    } else {
+        Color32::from_rgb(28, 28, 28)
+    };
     egui::Frame::new()
         .fill(bg)
         .corner_radius(6.0)
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(entry.time.format("%H:%M").to_string()).small().color(Color32::DARK_GRAY));
+                // Use pre-computed time_str — no format() call per frame
+                ui.label(RichText::new(&entry.time_str).small().color(Color32::DARK_GRAY));
                 ui.label(RichText::new(&entry.stats).small().color(Color32::DARK_GRAY));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button(RichText::new("✕").color(Color32::DARK_GRAY)).clicked() {
