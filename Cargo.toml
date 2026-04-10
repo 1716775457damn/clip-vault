@@ -3,6 +3,13 @@ name = "clip-vault"
 version = "0.1.0"
 edition = "2021"
 
+[package.metadata.bundle]
+name = "Clip Vault"
+identifier = "com.clipvault.app"
+icon = []
+copyright = "MIT 2025"
+category = "public.app-category.utilities"
+
 [dependencies]
 eframe = "0.31"
 egui = "0.31"

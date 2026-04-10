@@ -26,35 +26,43 @@ fn main() -> eframe::Result {
         }
     });
 
-    // System tray
-    let tray_menu = Menu::new();
-    let show_item = MenuItem::new("显示窗口", true, None);
-    let quit_item = MenuItem::new("退出", true, None);
-    let show_id = show_item.id().clone();
-    let quit_id  = quit_item.id().clone();
-    tray_menu.append(&show_item).ok();
-    tray_menu.append(&quit_item).ok();
-
-    let icon = tray_icon::Icon::from_rgba(make_icon(), 32, 32).expect("icon failed");
-    let _tray = TrayIconBuilder::new()
-        .with_menu(Box::new(tray_menu))
-        .with_tooltip("Clip Vault")
-        .with_icon(icon)
-        .build()
-        .expect("tray failed");
-
-    let (tray_tx, tray_rx) = mpsc::channel::<TrayMsg>();
-    std::thread::spawn(move || {
-        loop {
-            if let Ok(event) = MenuEvent::receiver().recv() {
-                if event.id == show_id {
-                    let _ = tray_tx.send(TrayMsg::Show);
-                } else if event.id == quit_id {
-                    let _ = tray_tx.send(TrayMsg::Quit);
+    // System tray (Windows/Linux only — macOS tray requires NSApp on main thread,
+    // handled differently; skip for now to keep cross-platform build working)
+    #[cfg(not(target_os = "macos"))]
+    let (_tray, tray_rx) = {
+        let tray_menu = Menu::new();
+        let show_item = MenuItem::new("显示窗口", true, None);
+        let quit_item = MenuItem::new("退出", true, None);
+        let show_id = show_item.id().clone();
+        let quit_id  = quit_item.id().clone();
+        tray_menu.append(&show_item).ok();
+        tray_menu.append(&quit_item).ok();
+        let icon = tray_icon::Icon::from_rgba(make_icon(), 32, 32).expect("icon failed");
+        let tray = TrayIconBuilder::new()
+            .with_menu(Box::new(tray_menu))
+            .with_tooltip("Clip Vault")
+            .with_icon(icon)
+            .build()
+            .expect("tray failed");
+        let (tray_tx, tray_rx) = mpsc::channel::<TrayMsg>();
+        std::thread::spawn(move || {
+            loop {
+                if let Ok(event) = MenuEvent::receiver().recv() {
+                    if event.id == show_id {
+                        let _ = tray_tx.send(TrayMsg::Show);
+                    } else if event.id == quit_id {
+                        let _ = tray_tx.send(TrayMsg::Quit);
+                    }
                 }
             }
-        }
-    });
+        });
+        (tray, tray_rx)
+    };
+    #[cfg(target_os = "macos")]
+    let tray_rx = {
+        let (_tx, rx) = mpsc::channel::<TrayMsg>();
+        rx
+    };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -68,10 +76,18 @@ fn main() -> eframe::Result {
 
     eframe::run_native("Clip Vault", options, Box::new(|cc| {
         let mut fonts = egui::FontDefinitions::default();
-        if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\msyh.ttc") {
-            fonts.font_data.insert("msyh".to_owned(), egui::FontData::from_owned(bytes).into());
-            fonts.families.entry(egui::FontFamily::Proportional).or_default().push("msyh".to_owned());
-            fonts.families.entry(egui::FontFamily::Monospace).or_default().push("msyh".to_owned());
+        let cjk_font_paths: &[&str] = &[
+            "C:\\Windows\\Fonts\\msyh.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        ];
+        for path in cjk_font_paths {
+            if let Ok(bytes) = std::fs::read(path) {
+                fonts.font_data.insert("cjk".to_owned(), egui::FontData::from_owned(bytes).into());
+                fonts.families.entry(egui::FontFamily::Proportional).or_default().push("cjk".to_owned());
+                fonts.families.entry(egui::FontFamily::Monospace).or_default().push("cjk".to_owned());
+                break;
+            }
         }
         cc.egui_ctx.set_fonts(fonts);
         Ok(Box::new(App::new(rx, triggered, tray_rx)))
