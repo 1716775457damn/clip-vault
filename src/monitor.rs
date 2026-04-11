@@ -14,28 +14,26 @@ pub fn start(tx: Sender<ClipContent>) {
         let mut last_img_hash: u64 = 0;
 
         loop {
-            // 200ms gives snappier feel vs 500ms, still low CPU
             thread::sleep(Duration::from_millis(200));
 
             if let Ok(text) = clipboard.get_text() {
                 let text = text.trim().to_string();
-                // Compare length first — cheap short-circuit for long strings
                 if !text.is_empty() && (text.len() != last_text.len() || text != last_text) {
                     last_text = text.clone();
-                    let _ = tx.send(ClipContent::Text(text));
+                    // Exit loop if receiver is gone (app shut down)
+                    if tx.send(ClipContent::Text(text)).is_err() { return; }
                 }
             }
 
             if let Ok(img) = clipboard.get_image() {
-                // Hash before copying bytes — skip copy if unchanged
                 let hash = fnv1a(&img.bytes);
                 if hash != last_img_hash {
                     last_img_hash = hash;
-                    let _ = tx.send(ClipContent::Image {
+                    if tx.send(ClipContent::Image {
                         width: img.width as u32,
                         height: img.height as u32,
                         rgba: img.bytes.into_owned(),
-                    });
+                    }).is_err() { return; }
                 }
             }
         }

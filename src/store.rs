@@ -62,10 +62,11 @@ fn make_preview(content: &ClipContent) -> String {
 fn make_stats(content: &ClipContent) -> (String, usize) {
     match content {
         ClipContent::Text(s) => {
-            // Single pass: count chars and lines simultaneously
+            let trimmed = s.trim();
+            if trimmed.is_empty() { return ("0 字".to_string(), 0); }
             let mut chars = 0usize;
             let mut lines = 1usize;
-            for ch in s.trim().chars() {
+            for ch in trimmed.chars() {
                 chars += 1;
                 if ch == '\n' { lines += 1; }
             }
