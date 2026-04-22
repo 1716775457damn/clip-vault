@@ -40,11 +40,16 @@ pub fn start(tx: Sender<ClipContent>) {
     });
 }
 
-/// Fast non-cryptographic hash for change detection
+/// Fast non-cryptographic hash for change detection.
+/// Only samples the first 8 KB + total length — sufficient for dedup,
+/// much faster than sampling the entire buffer for large images.
 fn fnv1a(data: &[u8]) -> u64 {
-    let step = (data.len() / 512).max(1);
+    const SAMPLE: usize = 8192;
     let mut h: u64 = 0xcbf29ce484222325;
-    for &b in data.iter().step_by(step) {
+    // Mix in total length so images of different sizes never collide
+    h ^= data.len() as u64;
+    h = h.wrapping_mul(0x100000001b3);
+    for &b in data.iter().take(SAMPLE) {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }

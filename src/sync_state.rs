@@ -83,13 +83,13 @@ impl Store {
 fn state_path() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("rust-seek")
+        .join("clip-vault")
         .join("sync-state.json")
 }
 
 fn config_path() -> Option<PathBuf> {
     Some(dirs::data_local_dir()?
-        .join("rust-seek")
+        .join("clip-vault")
         .join("sync-config.json"))
 }
 

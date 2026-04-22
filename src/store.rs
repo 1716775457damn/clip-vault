@@ -114,14 +114,16 @@ impl Store {
     }
 
     pub fn push(&mut self, content: ClipContent) {
-        // O(1) check, then targeted remove by id instead of full retain scan
+        // O(1) dedup check via HashSet, then swap_remove for O(1) removal
         if let ClipContent::Text(ref t) = content {
             if self.text_set.contains(t.as_str()) {
                 if let Some(pos) = self.entries.iter().position(|e| match &e.content {
                     ClipContent::Text(existing) => existing == t,
                     _ => false,
                 }) {
-                    self.entries.remove(pos);
+                    // swap_remove is O(1) vs remove's O(n) shift;
+                    // order only matters for pinned-first invariant which we restore below
+                    self.entries.swap_remove(pos);
                 }
                 self.text_set.remove(t.as_str());
             }

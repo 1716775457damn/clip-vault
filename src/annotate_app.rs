@@ -36,25 +36,26 @@ const PALETTE: &[Color32] = &[
 // ── Main struct ───────────────────────────────────────────────────────────────
 
 pub struct AnnotateApp {
-    /// Raw RGBA pixels of the captured screenshot
+    /// Raw RGBA pixels of the captured screenshot (never mutated)
     pixels: Option<Vec<u8>>,
     img_w: usize,
     img_h: usize,
-    /// egui texture (re-uploaded when annotations change)
+    /// Incrementally baked buffer: base + all committed annotations rendered in.
+    /// Avoids re-cloning and re-drawing the full annotation list on every change.
+    baked: Option<Vec<u8>>,
+    /// egui texture rebuilt from `baked` when dirty
     texture: Option<TextureHandle>,
     texture_dirty: bool,
 
     annotations: Vec<Annotation>,
     undo_stack:  Vec<Vec<Annotation>>,
 
-    // Current tool state
     tool:       ShapeKind,
     color:      Color32,
     stroke_w:   f32,
     filled:     bool,
 
-    // In-progress drag
-    drag_start: Option<Pos2>,   // image-pixel coords
+    drag_start: Option<Pos2>,
     cur_drag:   Option<Pos2>,
     pen_points: Vec<Pos2>,
 
@@ -64,19 +65,13 @@ pub struct AnnotateApp {
 impl Default for AnnotateApp {
     fn default() -> Self {
         Self {
-            pixels: None,
+            pixels: None, baked: None,
             img_w: 0, img_h: 0,
-            texture: None,
-            texture_dirty: false,
-            annotations: Vec::new(),
-            undo_stack: Vec::new(),
-            tool: ShapeKind::Rect,
-            color: PALETTE[0],
-            stroke_w: 3.0,
-            filled: false,
-            drag_start: None,
-            cur_drag: None,
-            pen_points: Vec::new(),
+            texture: None, texture_dirty: false,
+            annotations: Vec::new(), undo_stack: Vec::new(),
+            tool: ShapeKind::Rect, color: PALETTE[0],
+            stroke_w: 3.0, filled: false,
+            drag_start: None, cur_drag: None, pen_points: Vec::new(),
             status: "点击「截图」开始".to_string(),
         }
     }
@@ -95,6 +90,7 @@ impl AnnotateApp {
                             self.img_w = img.width() as usize;
                             self.img_h = img.height() as usize;
                             self.pixels = Some(img.into_raw());
+                            self.baked = self.pixels.clone(); // baked starts as clean base
                             self.annotations.clear();
                             self.undo_stack.clear();
                             self.texture = None;
@@ -117,67 +113,45 @@ impl AnnotateApp {
     fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
             self.annotations = prev;
+            // Undo must rebuild baked from scratch since we removed an annotation
+            self.rebuild_baked();
             self.texture_dirty = true;
         }
     }
 
-    /// Flatten annotations onto the base image and return RGBA bytes.
-    fn flatten_to_rgba(&self) -> Option<Vec<u8>> {
-        let base = self.pixels.as_ref()?;
-        let mut out = base.clone();
-        let w = self.img_w;
-        let h = self.img_h;
-
-        for ann in &self.annotations {
-            match ann.kind {
-                ShapeKind::Rect => {
-                    let x0 = ann.p1.x.min(ann.p2.x) as i32;
-                    let y0 = ann.p1.y.min(ann.p2.y) as i32;
-                    let x1 = ann.p1.x.max(ann.p2.x) as i32;
-                    let y1 = ann.p1.y.max(ann.p2.y) as i32;
-                    let lw = ann.width as i32;
-                    if ann.filled {
-                        fill_rect(&mut out, w, h, x0, y0, x1, y1, ann.color);
-                    } else {
-                        for t in 0..lw {
-                            draw_rect_outline(&mut out, w, h, x0+t, y0+t, x1-t, y1-t, ann.color);
-                        }
-                    }
-                }
-                ShapeKind::Ellipse => {
-                    let cx = ((ann.p1.x + ann.p2.x) / 2.0) as i32;
-                    let cy = ((ann.p1.y + ann.p2.y) / 2.0) as i32;
-                    let rx = ((ann.p2.x - ann.p1.x).abs() / 2.0) as i32;
-                    let ry = ((ann.p2.y - ann.p1.y).abs() / 2.0) as i32;
-                    draw_ellipse(&mut out, w, h, cx, cy, rx, ry, ann.color, ann.width as i32, ann.filled);
-                }
-                ShapeKind::Arrow => {
-                    draw_arrow(&mut out, w, h, ann.p1, ann.p2, ann.color, ann.width as i32);
-                }
-                ShapeKind::Pen => {
-                    for pair in ann.pen_points.windows(2) {
-                        draw_line_thick(&mut out, w, h, pair[0], pair[1], ann.color, ann.width as i32);
-                    }
-                }
+    /// Rebuild baked buffer from base pixels + all current annotations.
+    /// Called only on undo/clear — O(n annotations). Normal add is O(1) incremental.
+    fn rebuild_baked(&mut self) {
+        if let Some(ref base) = self.pixels {
+            let mut buf = base.clone();
+            let w = self.img_w; let h = self.img_h;
+            for ann in &self.annotations {
+                render_annotation_to_buf(&mut buf, w, h, ann);
             }
+            self.baked = Some(buf);
         }
-        Some(out)
+    }
+
+    /// Append one annotation onto the existing baked buffer — O(1) incremental.
+    fn bake_last(&mut self) {
+        if let (Some(ref mut baked), Some(ann)) = (&mut self.baked, self.annotations.last()) {
+            let w = self.img_w; let h = self.img_h;
+            render_annotation_to_buf(baked, w, h, ann);
+        }
     }
 
     /// Save annotated image to a PNG file.
     pub fn save_png(&self, path: &std::path::Path) -> anyhow::Result<()> {
-        let rgba = self.flatten_to_rgba().ok_or_else(|| anyhow::anyhow!("no image"))?;
-        image::save_buffer(path, &rgba, self.img_w as u32, self.img_h as u32, image::ColorType::Rgba8)?;
+        let rgba = self.baked.as_ref().ok_or_else(|| anyhow::anyhow!("no image"))?;
+        image::save_buffer(path, rgba, self.img_w as u32, self.img_h as u32, image::ColorType::Rgba8)?;
         Ok(())
     }
 
-    /// Copy annotated image to clipboard.
     pub fn copy_to_clipboard(&self) -> anyhow::Result<()> {
-        let rgba = self.flatten_to_rgba().ok_or_else(|| anyhow::anyhow!("no image"))?;
+        let rgba = self.baked.as_ref().ok_or_else(|| anyhow::anyhow!("no image"))?.clone();
         let img = arboard::ImageData {
-            width:  self.img_w,
-            height: self.img_h,
-            bytes:  std::borrow::Cow::Owned(rgba),
+            width: self.img_w, height: self.img_h,
+            bytes: std::borrow::Cow::Owned(rgba),
         };
         arboard::Clipboard::new()?.set_image(img)?;
         Ok(())
@@ -186,10 +160,8 @@ impl AnnotateApp {
     pub fn update(&mut self, ctx: &egui::Context) {
         // Rebuild texture when annotations change
         if self.texture_dirty {
-            if let Some(rgba) = self.flatten_to_rgba() {
-                let ci = ColorImage::from_rgba_unmultiplied(
-                    [self.img_w, self.img_h], &rgba,
-                );
+            if let Some(ref rgba) = self.baked {
+                let ci = ColorImage::from_rgba_unmultiplied([self.img_w, self.img_h], rgba);
                 self.texture = Some(ctx.load_texture("screenshot", ci, egui::TextureOptions::LINEAR));
             }
             self.texture_dirty = false;
@@ -267,10 +239,11 @@ impl AnnotateApp {
                 ).clicked() {
                     self.undo_stack.push(self.annotations.clone());
                     self.annotations.clear();
+                    self.baked = self.pixels.clone(); // reset baked to clean base
                     self.texture_dirty = true;
                 }
 
-                let has_img = self.pixels.is_some();
+                let has_img = self.baked.is_some();
                 if ui.add_enabled(has_img, egui::Button::new("📋 复制")
                     .min_size(egui::vec2(56.0, 26.0))
                 ).on_hover_text("复制到剪贴板").clicked() {
@@ -372,14 +345,13 @@ impl AnnotateApp {
                         self.pen_points.push(to_img(pos));
                         if self.pen_points.len() >= 2 {
                             self.annotations.push(Annotation {
-                                kind: ShapeKind::Pen,
-                                color: self.color,
-                                width: self.stroke_w,
-                                filled: false,
+                                kind: ShapeKind::Pen, color: self.color,
+                                width: self.stroke_w, filled: false,
                                 p1: *self.pen_points.first().unwrap(),
                                 p2: *self.pen_points.last().unwrap(),
                                 pen_points: self.pen_points.clone(),
                             });
+                            self.bake_last(); // incremental O(1)
                             self.texture_dirty = true;
                         }
                         self.pen_points.clear();
@@ -388,13 +360,11 @@ impl AnnotateApp {
                         if (end - start).length() > 3.0 {
                             self.undo_stack.push(self.annotations.clone());
                             self.annotations.push(Annotation {
-                                kind: self.tool,
-                                color: self.color,
-                                width: self.stroke_w,
-                                filled: self.filled,
-                                p1: start, p2: end,
-                                pen_points: Vec::new(),
+                                kind: self.tool, color: self.color,
+                                width: self.stroke_w, filled: self.filled,
+                                p1: start, p2: end, pen_points: Vec::new(),
                             });
+                            self.bake_last(); // incremental O(1)
                             self.texture_dirty = true;
                         }
                         self.cur_drag = None;
@@ -476,6 +446,41 @@ fn draw_annotation_egui(
 
 // ── Pixel-level drawing (for flatten/export) ──────────────────────────────────
 
+/// Render a single annotation onto a pixel buffer.
+pub fn render_annotation_to_buf(buf: &mut [u8], w: usize, h: usize, ann: &Annotation) {
+    match ann.kind {
+        ShapeKind::Rect => {
+            let x0 = ann.p1.x.min(ann.p2.x) as i32;
+            let y0 = ann.p1.y.min(ann.p2.y) as i32;
+            let x1 = ann.p1.x.max(ann.p2.x) as i32;
+            let y1 = ann.p1.y.max(ann.p2.y) as i32;
+            let lw = ann.width as i32;
+            if ann.filled {
+                fill_rect(buf, w, h, x0, y0, x1, y1, ann.color);
+            } else {
+                for t in 0..lw {
+                    draw_rect_outline(buf, w, h, x0+t, y0+t, x1-t, y1-t, ann.color);
+                }
+            }
+        }
+        ShapeKind::Ellipse => {
+            let cx = ((ann.p1.x + ann.p2.x) / 2.0) as i32;
+            let cy = ((ann.p1.y + ann.p2.y) / 2.0) as i32;
+            let rx = ((ann.p2.x - ann.p1.x).abs() / 2.0) as i32;
+            let ry = ((ann.p2.y - ann.p1.y).abs() / 2.0) as i32;
+            draw_ellipse(buf, w, h, cx, cy, rx, ry, ann.color, ann.width as i32, ann.filled);
+        }
+        ShapeKind::Arrow => {
+            draw_arrow(buf, w, h, ann.p1, ann.p2, ann.color, ann.width as i32);
+        }
+        ShapeKind::Pen => {
+            for pair in ann.pen_points.windows(2) {
+                draw_line_thick(buf, w, h, pair[0], pair[1], ann.color, ann.width as i32);
+            }
+        }
+    }
+}
+
 #[inline]
 fn set_pixel(buf: &mut [u8], w: usize, h: usize, x: i32, y: i32, c: Color32) {
     if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 { return; }
@@ -531,7 +536,12 @@ fn draw_line_thick(buf: &mut [u8], w: usize, h: usize, p1: Pos2, p2: Pos2, c: Co
 }
 
 fn draw_line_thick_i(buf: &mut [u8], w: usize, h: usize, x0: i32, y0: i32, x1: i32, y1: i32, c: Color32, lw: i32) {
-    // Bresenham with thickness via perpendicular offset
+    // Guard: zero-length line — just paint the single point
+    if x0 == x1 && y0 == y1 {
+        let half = lw / 2;
+        for ox in -half..=half { for oy in -half..=half { set_pixel(buf, w, h, x0+ox, y0+oy, c); } }
+        return;
+    }
     let dx = (x1 - x0).abs(); let dy = (y1 - y0).abs();
     let sx = if x0 < x1 { 1 } else { -1 };
     let sy = if y0 < y1 { 1 } else { -1 };
