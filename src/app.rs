@@ -863,6 +863,7 @@ pub struct App {
     sync:     SyncApp,
     annotate: AnnotateApp,
     is_dark:  bool,
+    annotate_capture_pending: bool,
     pub hotkey_triggered: Arc<AtomicBool>,
     pub tray_rx: std::sync::mpsc::Receiver<TrayMsg>,
 }
@@ -880,6 +881,7 @@ impl App {
             sync:     SyncApp::default(),
             annotate: AnnotateApp::default(),
             is_dark:  true,
+            annotate_capture_pending: false,
             hotkey_triggered,
             tray_rx,
         }
@@ -967,7 +969,26 @@ impl eframe::App for App {
             }
             Tab::Search   => self.search.update(ctx),
             Tab::Sync     => self.sync.update(ctx),
-            Tab::Annotate => self.annotate.update(ctx),
+            Tab::Annotate => {
+                // update() returns true when hotkey/button triggers capture
+                let want_capture = self.annotate.update(ctx);
+                if want_capture {
+                    // Hide window, wait one frame, then grab screen
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    // Schedule grab on next frame via a flag
+                    self.annotate_capture_pending = true;
+                }
+                if self.annotate_capture_pending {
+                    // Give the OS time to actually hide the window
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    self.annotate.grab_fullscreen();
+                    self.annotate_capture_pending = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.request_repaint();
+                }
+                self.annotate.editing_panel(ctx);
+            }
         }
     }
 }
