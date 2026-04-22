@@ -1,144 +1,82 @@
 //! Windows-specific capture helpers.
-//!
-//! Provides:
-//! - `enum_visible_windows`  — enumerate all visible top-level windows with their rects
-//! - `hovered_window_rect`   — find the deepest visible window/control under the cursor
-//! - `capture_rect_gdi`      — capture an arbitrary screen rect via GDI BitBlt (faster
-//!                             than screenshots crate for sub-regions, handles layered
-//!                             windows and full-screen apps correctly)
-//! - `LowLevelMouseHook`     — install WH_MOUSE_LL for precise pointer events outside
-//!                             the egui window (used during the selection overlay)
-
 #![cfg(target_os = "windows")]
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
-// ── Win32 imports ─────────────────────────────────────────────────────────────
-
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT, TRUE};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
-    GetDC, ReleaseDC, SelectObject, SRCCOPY, HBITMAP, HDC,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC,
+    GetDC, ReleaseDC, SelectObject, ROP_CODE, HBITMAP, HDC,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, EnumWindows, GetWindowRect, GetWindowTextW,
-    IsIconic, IsWindowVisible, RealChildWindowFromPoint, SetWindowsHookExW,
+    CallNextHookEx, GetWindowRect,
+    IsIconic, IsWindowVisible, SetWindowsHookExW,
     UnhookWindowsHookEx, WindowFromPoint, HHOOK, MSLLHOOKSTRUCT,
     WH_MOUSE_LL, WM_LBUTTONDOWN,
-    GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TRANSPARENT,
+    GWL_EXSTYLE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    GetWindowLongPtrW,
 };
 
-// ── Window info ───────────────────────────────────────────────────────────────
+// ── Smart window detection ────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
-pub struct WindowInfo {
-    pub hwnd:  isize,
-    pub rect:  [i32; 4], // left, top, right, bottom
-    pub title: String,
-    pub is_fullscreen: bool,
-    pub is_layered:    bool,
-}
-
-impl WindowInfo {
-    pub fn width(&self)  -> i32 { self.rect[2] - self.rect[0] }
-    pub fn height(&self) -> i32 { self.rect[3] - self.rect[1] }
-}
-
-/// Enumerate all visible, non-minimised top-level windows.
-/// Filters out tool windows, transparent overlays, and zero-size windows.
-pub fn enum_visible_windows() -> Vec<WindowInfo> {
-    let results: Arc<Mutex<Vec<WindowInfo>>> = Arc::new(Mutex::new(Vec::new()));
-    let results_clone = results.clone();
-
-    unsafe {
-        let ptr = Arc::into_raw(results_clone) as isize;
-        let _ = EnumWindows(Some(enum_callback), LPARAM(ptr));
-        // Reconstruct Arc to drop it properly
-        let _ = Arc::from_raw(ptr as *const Mutex<Vec<WindowInfo>>);
-    }
-
-    Arc::try_unwrap(results).unwrap_or_default().into_inner().unwrap_or_default()
-}
-
-unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    if IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() {
-        let mut rect = RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_ok() {
-            let w = rect.right  - rect.left;
-            let h = rect.bottom - rect.top;
-            if w <= 0 || h <= 0 { return TRUE; }
-
-            // Get extended style to filter tool/transparent windows
-            use windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW;
-            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-            if ex_style & WS_EX_TOOLWINDOW.0 != 0 { return TRUE; }
-            if ex_style & WS_EX_TRANSPARENT.0 != 0 { return TRUE; }
-
-            // Get title (empty-title windows are usually system/background)
-            let mut buf = [0u16; 256];
-            let len = GetWindowTextW(hwnd, &mut buf);
-            let title = String::from_utf16_lossy(&buf[..len as usize]);
-
-            // Detect full-screen: covers entire primary monitor
-            let is_fullscreen = rect.left == 0 && rect.top == 0
-                && w >= 1920 && h >= 1080; // heuristic
-
-            let is_layered = ex_style & WS_EX_LAYERED.0 != 0;
-
-            let results = &*(lparam.0 as *const Mutex<Vec<WindowInfo>>);
-            if let Ok(mut v) = results.lock() {
-                v.push(WindowInfo {
-                    hwnd: hwnd.0 as isize,
-                    rect: [rect.left, rect.top, rect.right, rect.bottom],
-                    title,
-                    is_fullscreen,
-                    is_layered,
-                });
-            }
-        }
-    }
-    TRUE
-}
-
-/// Find the deepest visible window/control under the given screen point.
-/// Uses `RealChildWindowFromPoint` to drill into child controls.
-/// Returns the bounding rect of the best candidate.
-pub fn hovered_window_rect(screen_x: i32, screen_y: i32) -> Option<[i32; 4]> {
+/// Find the best window to highlight under the given screen point.
+///
+/// Strategy (matches Snipaste / ShareX behaviour):
+/// 1. Get the top-level window under the cursor via `WindowFromPoint`.
+/// 2. Walk up to the root owner to avoid highlighting child controls by default.
+/// 3. Filter out: invisible, minimised, tool windows, transparent overlays,
+///    zero-size windows, and the caller's own HWND.
+/// 4. Return the window's screen rect in physical pixels.
+pub fn hovered_window_rect(screen_x: i32, screen_y: i32, own_hwnd: isize) -> Option<[i32; 4]> {
     unsafe {
         let pt = POINT { x: screen_x, y: screen_y };
-        let top = WindowFromPoint(pt);
-        if top.0 == std::ptr::null_mut() { return None; }
+        let hwnd = WindowFromPoint(pt);
+        if hwnd.0.is_null() { return None; }
 
-        // Convert screen point to client coords for child detection
-        let mut client_pt = pt;
-        use windows::Win32::Graphics::Gdi::ScreenToClient;
-        let _ = ScreenToClient(top, &mut client_pt);
+        // Skip our own overlay window
+        if hwnd.0 as isize == own_hwnd { return None; }
 
-        // Try to find the deepest child control
-        let child = RealChildWindowFromPoint(top, client_pt);
-        let target = if child.0 != std::ptr::null_mut() && child != top { child } else { top };
+        // Walk up to the root (non-child) window — avoids tiny child controls
+        let root = get_ancestor_root(hwnd);
+
+        // Filter: must be visible, not minimised
+        if !IsWindowVisible(root).as_bool() { return None; }
+        if IsIconic(root).as_bool()         { return None; }
+
+        // Filter extended styles
+        let ex = GetWindowLongPtrW(root, GWL_EXSTYLE) as u32;
+        if ex & WS_EX_TOOLWINDOW.0  != 0 { return None; }
+        if ex & WS_EX_TRANSPARENT.0 != 0 { return None; }
 
         let mut rect = RECT::default();
-        GetWindowRect(target, &mut rect).ok()?;
-
+        GetWindowRect(root, &mut rect).ok()?;
         let w = rect.right  - rect.left;
         let h = rect.bottom - rect.top;
-        if w <= 0 || h <= 0 { return None; }
+        if w <= 4 || h <= 4 { return None; }
 
         Some([rect.left, rect.top, rect.right, rect.bottom])
     }
 }
 
+/// Walk up the window hierarchy to find the root ancestor (non-child window).
+unsafe fn get_ancestor_root(hwnd: HWND) -> HWND {
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GA_ROOT};
+    let root = GetAncestor(hwnd, GA_ROOT);
+    if root.0.is_null() { hwnd } else { root }
+}
+
+/// Get the HWND of the foreground window (used to identify our own window).
+pub fn get_own_hwnd() -> isize {
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        GetForegroundWindow().0 as isize
+    }
+}
+
 // ── GDI capture ───────────────────────────────────────────────────────────────
 
-/// Capture a screen rectangle using GDI BitBlt.
-///
-/// Advantages over `screenshots` crate for sub-regions:
-/// - Handles layered (WS_EX_LAYERED) windows correctly via CAPTUREBLT
-/// - Works with full-screen DirectX/OpenGL apps (uses desktop DC)
-/// - No intermediate full-screen allocation — only allocates the target rect
-///
+/// Capture a screen rectangle using GDI BitBlt + CAPTUREBLT.
+/// Handles layered windows, full-screen apps, and DPI scaling correctly.
 /// Returns RGBA bytes (width × height × 4).
 pub fn capture_rect_gdi(left: i32, top: i32, width: i32, height: i32) -> Option<Vec<u8>> {
     if width <= 0 || height <= 0 { return None; }
@@ -150,18 +88,21 @@ pub fn capture_rect_gdi(left: i32, top: i32, width: i32, height: i32) -> Option<
         let bmp: HBITMAP = CreateCompatibleBitmap(screen_dc, width, height);
         let old = SelectObject(mem_dc, bmp);
 
-        // CAPTUREBLT (0x40000000) includes layered windows
-        const CAPTUREBLT: u32 = 0x40000000;
+        // SRCCOPY | CAPTUREBLT — includes layered (WS_EX_LAYERED) windows
+        const CAPTUREBLT: u32 = 0x4000_0000;
+        const SRCCOPY_VAL: u32 = 0x00CC_0020;
         let _ = BitBlt(mem_dc, 0, 0, width, height,
-                       screen_dc, left, top, SRCCOPY | windows::Win32::Graphics::Gdi::ROP_CODE(CAPTUREBLT));
+                       screen_dc, left, top, ROP_CODE(SRCCOPY_VAL | CAPTUREBLT));
 
         // Read pixels via GetDIBits
-        use windows::Win32::Graphics::Gdi::{GetDIBits, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, BI_RGB};
+        use windows::Win32::Graphics::Gdi::{
+            GetDIBits, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, BI_RGB,
+        };
         let mut bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize:        std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth:       width,
-                biHeight:      -height, // top-down
+                biHeight:      -height, // top-down DIB
                 biPlanes:      1,
                 biBitCount:    32,
                 biCompression: BI_RGB.0,
@@ -173,15 +114,15 @@ pub fn capture_rect_gdi(left: i32, top: i32, width: i32, height: i32) -> Option<
         GetDIBits(mem_dc, bmp, 0, height as u32,
                   Some(bgra.as_mut_ptr() as *mut _), &mut bmi, DIB_RGB_COLORS);
 
-        // Convert BGRA → RGBA
+        // BGRA → RGBA in-place
         for chunk in bgra.chunks_exact_mut(4) {
-            chunk.swap(0, 2); // B↔R
+            chunk.swap(0, 2);
             chunk[3] = 255;
         }
 
         SelectObject(mem_dc, old);
-        DeleteObject(bmp);
-        DeleteDC(mem_dc);
+        let _ = windows::Win32::Graphics::Gdi::DeleteObject(bmp);
+        let _ = DeleteDC(mem_dc);
         ReleaseDC(HWND(std::ptr::null_mut()), screen_dc);
 
         Some(bgra)
@@ -190,13 +131,10 @@ pub fn capture_rect_gdi(left: i32, top: i32, width: i32, height: i32) -> Option<
 
 // ── Low-level mouse hook ──────────────────────────────────────────────────────
 
-/// Shared state written by the hook, read by the UI thread.
 #[derive(Default, Clone)]
 pub struct MouseState {
-    /// Current cursor position in screen pixels
-    pub pos:      (i32, i32),
-    /// Left button just pressed (cleared after read)
-    pub clicked:  bool,
+    pub pos:     (i32, i32),
+    pub clicked: bool,
 }
 
 static HOOK_STATE: Mutex<Option<MouseState>> = Mutex::new(None);
@@ -206,8 +144,6 @@ pub struct LowLevelMouseHook {
 }
 
 impl LowLevelMouseHook {
-    /// Install WH_MOUSE_LL. Must be called from a thread with a message loop,
-    /// or from the main thread (egui's event loop satisfies this on Windows).
     pub fn install() -> Option<Self> {
         unsafe {
             *HOOK_STATE.lock().unwrap() = Some(MouseState::default());
@@ -216,12 +152,10 @@ impl LowLevelMouseHook {
         }
     }
 
-    /// Read and clear the current mouse state.
     pub fn poll() -> MouseState {
         HOOK_STATE.lock().unwrap().clone().unwrap_or_default()
     }
 
-    /// Clear the clicked flag after consuming it.
     pub fn consume_click() {
         if let Ok(mut g) = HOOK_STATE.lock() {
             if let Some(ref mut s) = *g { s.clicked = false; }
@@ -237,7 +171,8 @@ impl Drop for LowLevelMouseHook {
 }
 
 unsafe extern "system" fn ll_mouse_proc(
-    code: i32, wparam: windows::Win32::Foundation::WPARAM,
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     if code >= 0 {
