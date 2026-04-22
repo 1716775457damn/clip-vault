@@ -48,6 +48,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Set macOS deployment target
+        if: matrix.os == 'macos-latest'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> $GITHUB_ENV
+
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-22.04'
         run: |

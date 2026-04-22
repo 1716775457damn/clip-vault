@@ -1,9 +1,9 @@
 fn main() {
-    if std::env::var("PROFILE").unwrap_or_default() == "release" {
-        #[cfg(target_os = "windows")]
-        {
-            println!("cargo:rustc-link-arg=/SUBSYSTEM:WINDOWS");
-            println!("cargo:rustc-link-arg=/ENTRY:mainCRTStartup");
-        }
+    #[cfg(target_os = "macos")]
+    {
+        println!("cargo:rustc-link-lib=framework=CoreGraphics");
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+        println!("cargo:rustc-link-lib=framework=AppKit");
+        println!("cargo:rustc-link-lib=framework=CoreServices");
     }
 }
