@@ -9,7 +9,7 @@ use egui::{Color32, RichText, ScrollArea, TextEdit, TextureHandle, Vec2};
 use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -863,7 +863,12 @@ pub struct App {
     sync:     SyncApp,
     annotate: AnnotateApp,
     is_dark:  bool,
-    pub hotkey_triggered: Arc<AtomicBool>,
+    pub hotkey_triggered:       Arc<AtomicBool>,
+    pub screenshot_triggered:   Arc<AtomicBool>,
+    /// Stored so we can re-register the screenshot hotkey when config changes
+    screenshot_hotkey_id: u32,
+    screenshot_id_atomic: Arc<AtomicU32>,
+    hotkey_manager: global_hotkey::GlobalHotKeyManager,
     pub tray_rx: std::sync::mpsc::Receiver<TrayMsg>,
 }
 
@@ -871,16 +876,24 @@ impl App {
     pub fn new(
         rx: Receiver<ClipContent>,
         hotkey_triggered: Arc<AtomicBool>,
+        screenshot_triggered: Arc<AtomicBool>,
+        hotkey_manager: global_hotkey::GlobalHotKeyManager,
+        screenshot_hotkey_id: u32,
+        screenshot_id_atomic: Arc<AtomicU32>,
         tray_rx: std::sync::mpsc::Receiver<TrayMsg>,
     ) -> Self {
         Self {
-            tab:      Tab::Clip,
-            clip:     ClipApp::new(rx),
-            search:   SearchApp::default(),
-            sync:     SyncApp::default(),
+            tab: Tab::Clip,
+            clip: ClipApp::new(rx),
+            search: SearchApp::default(),
+            sync: SyncApp::default(),
             annotate: AnnotateApp::default(),
-            is_dark:  true,
+            is_dark: true,
             hotkey_triggered,
+            screenshot_triggered,
+            screenshot_hotkey_id,
+            screenshot_id_atomic,
+            hotkey_manager,
             tray_rx,
         }
     }
@@ -919,6 +932,23 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             self.clip.just_shown = true;
+        }
+
+        // Screenshot hotkey → trigger capture directly, no focus needed
+        if self.screenshot_triggered.swap(false, Ordering::Relaxed) {
+            self.annotate.trigger_capture();
+            self.tab = Tab::Annotate;
+        }
+
+        // Re-register screenshot hotkey if config changed
+        if self.annotate.hotkey_changed {
+            self.annotate.hotkey_changed = false;
+            let new_hk = self.annotate.hotkey.to_global_hotkey();
+            let new_id = new_hk.id();
+            if self.hotkey_manager.register(new_hk).is_ok() {
+                self.screenshot_hotkey_id = new_id;
+                self.screenshot_id_atomic.store(new_id, Ordering::Relaxed);
+            }
         }
 
         // T key toggles theme

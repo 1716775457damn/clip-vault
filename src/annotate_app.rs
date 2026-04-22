@@ -49,13 +49,41 @@ impl HotkeyConfig {
         hotkey_path().and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
     }
+    /// Public alias for use in main.rs before App is constructed.
+    pub fn load_static() -> Self { Self::load() }
+
     fn save(&self) {
         if let Some(p) = hotkey_path() {
             let _ = std::fs::create_dir_all(p.parent().unwrap());
             if let Ok(s) = serde_json::to_string(self) { let _ = std::fs::write(p, s); }
         }
     }
-}
+    pub fn save_pub(&self) { self.save(); }
+
+    /// Convert to a `global-hotkey` HotKey for system-level registration.
+    pub fn to_global_hotkey(&self) -> global_hotkey::hotkey::HotKey {
+        use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+        let mut mods = Modifiers::empty();
+        if self.ctrl  { mods |= Modifiers::CONTROL; }
+        if self.shift { mods |= Modifiers::SHIFT; }
+        if self.alt   { mods |= Modifiers::ALT; }
+        let code = match self.key.to_uppercase().as_str() {
+            "A"=>Code::KeyA,"B"=>Code::KeyB,"C"=>Code::KeyC,"D"=>Code::KeyD,
+            "E"=>Code::KeyE,"F"=>Code::KeyF,"G"=>Code::KeyG,"H"=>Code::KeyH,
+            "I"=>Code::KeyI,"J"=>Code::KeyJ,"K"=>Code::KeyK,"L"=>Code::KeyL,
+            "M"=>Code::KeyM,"N"=>Code::KeyN,"O"=>Code::KeyO,"P"=>Code::KeyP,
+            "Q"=>Code::KeyQ,"R"=>Code::KeyR,"S"=>Code::KeyS,"T"=>Code::KeyT,
+            "U"=>Code::KeyU,"V"=>Code::KeyV,"W"=>Code::KeyW,"X"=>Code::KeyX,
+            "Y"=>Code::KeyY,"Z"=>Code::KeyZ,
+            "F1"=>Code::F1,"F2"=>Code::F2,"F3"=>Code::F3,"F4"=>Code::F4,
+            "F5"=>Code::F5,"F6"=>Code::F6,"F7"=>Code::F7,"F8"=>Code::F8,
+            "F9"=>Code::F9,"F10"=>Code::F10,"F11"=>Code::F11,"F12"=>Code::F12,
+            _ => Code::KeyS, // fallback
+        };
+        HotKey::new(if mods.is_empty() { None } else { Some(mods) }, code)
+    }
+} // end impl HotkeyConfig
+
 fn hotkey_path() -> Option<std::path::PathBuf> {
     Some(dirs::data_local_dir()?.join("clip-vault").join("hotkey.json"))
 }
@@ -103,6 +131,8 @@ pub struct AnnotateApp {
 
     pub hotkey:     HotkeyConfig,
     editing_hotkey: bool,
+    /// Set when hotkey is saved, so App can re-register the global hotkey
+    pub hotkey_changed: bool,
 
     smart_rect: Option<[i32; 4]>,
 
@@ -132,6 +162,7 @@ impl Default for AnnotateApp {
             tool: ShapeKind::Rect, color: PALETTE[0], stroke_w: 3.0, filled: false,
             drag_start: None, cur_drag: None, pen_points: Vec::new(),
             hotkey: HotkeyConfig::load(), editing_hotkey: false,
+            hotkey_changed: false,
             smart_rect: None,
             #[cfg(target_os = "windows")] own_hwnds: Vec::new(),
             #[cfg(target_os = "windows")] mouse_hook: None,
@@ -282,9 +313,18 @@ impl AnnotateApp {
         Ok(())
     }
 
+    /// Called by App when the global screenshot hotkey fires.
+    /// Immediately starts capture without requiring window focus.
+    pub fn trigger_capture(&mut self) {
+        if self.capture_state == CaptureState::Idle {
+            self.capture_btn_clicked = true;
+        }
+    }
+
     /// Returns true when the window should be hidden to start capture.
     pub fn update(&mut self, ctx: &egui::Context) -> bool {
-        // ── Hotkey ────────────────────────────────────────────────────────────
+        // Hotkey is now handled externally via trigger_capture().
+        // Keep egui-based detection only as fallback when window has focus.
         if self.capture_state == CaptureState::Idle && !self.editing_hotkey {
             if self.hotkey.matches(ctx) { return true; }
         }
@@ -431,7 +471,11 @@ impl AnnotateApp {
                     ui.checkbox(&mut self.hotkey.shift, "Shift");
                     ui.checkbox(&mut self.hotkey.alt, "Alt");
                     ui.add(egui::TextEdit::singleline(&mut self.hotkey.key).desired_width(36.0).hint_text("S"));
-                    if ui.button("✓ 保存").clicked() { self.hotkey.save(); self.editing_hotkey = false; }
+                    if ui.button("✓ 保存").clicked() {
+                        self.hotkey.save_pub();
+                        self.hotkey_changed = true;
+                        self.editing_hotkey = false;
+                    }
                     if ui.button("✕").clicked() { self.editing_hotkey = false; }
                 } else {
                     ui.label(egui::RichText::new(self.hotkey.label()).color(Color32::from_rgb(56,189,248)).size(11.5));

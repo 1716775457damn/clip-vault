@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod annotate_app;
 mod app;
 mod monitor;
@@ -12,8 +14,12 @@ mod theme;
 mod win_capture;
 
 use app::{App, TrayMsg};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, hotkey::{Code, HotKey, Modifiers}};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use annotate_app::HotkeyConfig;
+use global_hotkey::{
+    GlobalHotKeyEvent, GlobalHotKeyManager,
+    hotkey::{Code, HotKey, Modifiers},
+};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}};
 use std::sync::mpsc;
 use tray_icon::{TrayIconBuilder, menu::{Menu, MenuItem, MenuEvent}};
 
@@ -22,26 +28,48 @@ fn main() -> eframe::Result {
     monitor::start(tx);
 
     let manager = GlobalHotKeyManager::new().expect("hotkey manager failed");
-    let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyV);
-    manager.register(hotkey).expect("hotkey register failed");
 
-    let triggered = Arc::new(AtomicBool::new(false));
-    let triggered_clone = triggered.clone();
-    std::thread::spawn(move || {
-        loop {
-            if GlobalHotKeyEvent::receiver().recv().is_ok() {
-                triggered_clone.store(true, Ordering::Relaxed);
+    // ── Clipboard hotkey: Ctrl+Shift+V ────────────────────────────────────────
+    let clip_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyV);
+    manager.register(clip_hotkey).expect("clip hotkey register failed");
+    let clip_id = clip_hotkey.id();
+
+    // ── Screenshot hotkey: read from saved config ─────────────────────────────
+    let screenshot_cfg = HotkeyConfig::load_static();
+    let screenshot_hotkey = screenshot_cfg.to_global_hotkey();
+    let screenshot_id_init = screenshot_hotkey.id();
+    let _ = manager.register(screenshot_hotkey);
+
+    // Shared atomic so the event thread always reads the current hotkey id
+    let screenshot_id_atomic = Arc::new(AtomicU32::new(screenshot_id_init));
+
+    let clip_triggered       = Arc::new(AtomicBool::new(false));
+    let screenshot_triggered = Arc::new(AtomicBool::new(false));
+    {
+        let clip_clone       = clip_triggered.clone();
+        let screenshot_clone = screenshot_triggered.clone();
+        let sid              = screenshot_id_atomic.clone();
+        std::thread::spawn(move || {
+            loop {
+                if let Ok(event) = GlobalHotKeyEvent::receiver().recv() {
+                    if event.id == clip_id {
+                        clip_clone.store(true, Ordering::Relaxed);
+                    } else if event.id == sid.load(Ordering::Relaxed) {
+                        screenshot_clone.store(true, Ordering::Relaxed);
+                    }
+                }
             }
-        }
-    });
+        });
+    }
 
+    // ── System tray ───────────────────────────────────────────────────────────
     #[cfg(not(target_os = "macos"))]
     let (_tray, tray_rx) = {
         let tray_menu = Menu::new();
         let show_item = MenuItem::new("显示窗口", true, None);
         let quit_item = MenuItem::new("退出", true, None);
         let show_id = show_item.id().clone();
-        let quit_id  = quit_item.id().clone();
+        let quit_id = quit_item.id().clone();
         tray_menu.append(&show_item).ok();
         tray_menu.append(&quit_item).ok();
         let icon = tray_icon::Icon::from_rgba(make_icon(), 32, 32).expect("icon failed");
@@ -84,7 +112,11 @@ fn main() -> eframe::Result {
         fonts.families.entry(egui::FontFamily::Proportional).or_default().push("cjk".to_owned());
         fonts.families.entry(egui::FontFamily::Monospace).or_default().push("cjk".to_owned());
         cc.egui_ctx.set_fonts(fonts);
-        Ok(Box::new(App::new(rx, triggered, tray_rx)))
+        Ok(Box::new(App::new(
+            rx, clip_triggered, screenshot_triggered,
+            manager, screenshot_id_init, screenshot_id_atomic,
+            tray_rx,
+        )))
     }))
 }
 
