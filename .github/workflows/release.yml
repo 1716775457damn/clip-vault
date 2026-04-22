@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     strategy:
@@ -51,11 +54,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev \
             libxkbcommon-dev libssl-dev \
             libgtk-3-dev \
             libglib2.0-dev \
             libayatana-appindicator3-dev \
             libdbus-1-dev \
+            libxdo-dev \
             pkg-config
 
       - name: Cache Rust
