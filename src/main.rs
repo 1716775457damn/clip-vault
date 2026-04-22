@@ -1,6 +1,13 @@
+mod annotate_app;
 mod app;
 mod monitor;
+mod searcher;
 mod store;
+mod sync_app;
+mod sync_state;
+mod sync_syncer;
+mod sync_watcher;
+mod theme;
 
 use app::{App, TrayMsg};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, hotkey::{Code, HotKey, Modifiers}};
@@ -26,8 +33,6 @@ fn main() -> eframe::Result {
         }
     });
 
-    // System tray (Windows/Linux only — macOS tray requires NSApp on main thread,
-    // handled differently; skip for now to keep cross-platform build working)
     #[cfg(not(target_os = "macos"))]
     let (_tray, tray_rx) = {
         let tray_menu = Menu::new();
@@ -48,117 +53,59 @@ fn main() -> eframe::Result {
         std::thread::spawn(move || {
             loop {
                 if let Ok(event) = MenuEvent::receiver().recv() {
-                    if event.id == show_id {
-                        let _ = tray_tx.send(TrayMsg::Show);
-                    } else if event.id == quit_id {
-                        let _ = tray_tx.send(TrayMsg::Quit);
-                    }
+                    if event.id == show_id      { let _ = tray_tx.send(TrayMsg::Show); }
+                    else if event.id == quit_id { let _ = tray_tx.send(TrayMsg::Quit); }
                 }
             }
         });
         (tray, tray_rx)
     };
     #[cfg(target_os = "macos")]
-    let tray_rx = {
-        let (_tx, rx) = mpsc::channel::<TrayMsg>();
-        rx
-    };
+    let tray_rx = { let (_tx, rx) = mpsc::channel::<TrayMsg>(); rx };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Clip Vault")
-            .with_inner_size([360.0, 560.0])
-            .with_min_inner_size([300.0, 400.0])
+            .with_inner_size([900.0, 620.0])
+            .with_min_inner_size([600.0, 420.0])
             .with_always_on_top()
             .with_close_button(true),
         ..Default::default()
     };
 
     eframe::run_native("Clip Vault", options, Box::new(|cc| {
+        theme::apply_style(&cc.egui_ctx);
+        cc.egui_ctx.set_visuals(theme::dark_visuals());
         let mut fonts = egui::FontDefinitions::default();
-
-        // Embed Noto Sans SC for guaranteed CJK support on all platforms
         let cjk_bytes: &[u8] = include_bytes!("../assets/NotoSansSC-Regular.otf");
-        fonts.font_data.insert(
-            "cjk".to_owned(),
-            egui::FontData::from_static(cjk_bytes).into(),
-        );
-        fonts.families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .push("cjk".to_owned());
-        fonts.families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .push("cjk".to_owned());
+        fonts.font_data.insert("cjk".to_owned(), egui::FontData::from_static(cjk_bytes).into());
+        fonts.families.entry(egui::FontFamily::Proportional).or_default().push("cjk".to_owned());
+        fonts.families.entry(egui::FontFamily::Monospace).or_default().push("cjk".to_owned());
         cc.egui_ctx.set_fonts(fonts);
         Ok(Box::new(App::new(rx, triggered, tray_rx)))
     }))
 }
 
-/// 32×32 RGBA clipboard icon with rounded corners, clip bar, and text lines
 fn make_icon() -> Vec<u8> {
     const S: usize = 32;
     let mut px = vec![0u8; S * S * 4];
-
     let set = |px: &mut Vec<u8>, x: usize, y: usize, r: u8, g: u8, b: u8, a: u8| {
-        if x < S && y < S {
-            let i = (y * S + x) * 4;
-            px[i] = r; px[i+1] = g; px[i+2] = b; px[i+3] = a;
-        }
+        if x < S && y < S { let i = (y*S+x)*4; px[i]=r; px[i+1]=g; px[i+2]=b; px[i+3]=a; }
     };
-
-    // Draw filled rounded rectangle (clipboard body): x 3..28, y 5..30, radius 3
-    for y in 0..S {
-        for x in 0..S {
-            let (fx, fy) = (x as i32, y as i32);
-            // Body: rounded rect 3..28, 5..30
-            let in_body = fx >= 3 && fx <= 28 && fy >= 5 && fy <= 30;
-            // Corner cutouts
-            let corner = (fx < 6 && fy < 8) || (fx > 25 && fy < 8)
-                      || (fx < 6 && fy > 27) || (fx > 25 && fy > 27);
-            // Clip bar at top: x 10..21, y 3..9
-            let clip_bar = fx >= 10 && fx <= 21 && fy >= 3 && fy <= 9;
-            // Clip bar hole: x 13..18, y 3..6
-            let clip_hole = fx >= 13 && fx <= 18 && fy >= 3 && fy <= 6;
-
-            if clip_bar && !clip_hole {
-                // Clip bar: darker blue-grey
-                set(&mut px, x, y, 90, 110, 160, 255);
-            } else if in_body && !corner {
-                // Body gradient: top is lighter, bottom darker
-                let t = fy as f32 / S as f32;
-                let r = (100.0 - t * 20.0) as u8;
-                let g = (150.0 - t * 30.0) as u8;
-                let b = (230.0 - t * 20.0) as u8;
-                set(&mut px, x, y, r, g, b, 255);
-            }
+    for y in 0..S { for x in 0..S {
+        let (fx, fy) = (x as i32, y as i32);
+        let in_body = fx>=3 && fx<=28 && fy>=5 && fy<=30;
+        let corner  = (fx<6&&fy<8)||(fx>25&&fy<8)||(fx<6&&fy>27)||(fx>25&&fy>27);
+        let clip_bar  = fx>=10 && fx<=21 && fy>=3 && fy<=9;
+        let clip_hole = fx>=13 && fx<=18 && fy>=3 && fy<=6;
+        if clip_bar && !clip_hole { set(&mut px, x, y, 90, 110, 160, 255); }
+        else if in_body && !corner {
+            let t = fy as f32 / S as f32;
+            set(&mut px, x, y, (100.0-t*20.0) as u8, (150.0-t*30.0) as u8, (230.0-t*20.0) as u8, 255);
         }
-    }
-
-    // Text lines on clipboard body (white, semi-transparent)
-    // Line 1: y=13, x 7..24
-    for x in 7..25usize { set(&mut px, x, 13, 255, 255, 255, 200); }
-    for x in 7..25usize { set(&mut px, x, 14, 255, 255, 255, 200); }
-    // Line 2: y=18, x 7..24
-    for x in 7..25usize { set(&mut px, x, 18, 255, 255, 255, 200); }
-    for x in 7..25usize { set(&mut px, x, 19, 255, 255, 255, 200); }
-    // Line 3: y=23, x 7..18 (shorter)
-    for x in 7..19usize { set(&mut px, x, 23, 255, 255, 255, 200); }
-    for x in 7..19usize { set(&mut px, x, 24, 255, 255, 255, 200); }
-
-    // Border: 1px outline around body
-    for y in 5..=30usize {
-        for x in 3..=28usize {
-            let (fx, fy) = (x as i32, y as i32);
-            let on_edge = fx == 3 || fx == 28 || fy == 5 || fy == 30;
-            let corner = (fx < 6 && fy < 8) || (fx > 25 && fy < 8)
-                      || (fx < 6 && fy > 27) || (fx > 25 && fy > 27);
-            if on_edge && !corner {
-                set(&mut px, x, y, 60, 90, 180, 255);
-            }
-        }
-    }
-
+    }}
+    for x in 7..25usize { set(&mut px, x, 13, 255,255,255,200); set(&mut px, x, 14, 255,255,255,200); }
+    for x in 7..25usize { set(&mut px, x, 18, 255,255,255,200); set(&mut px, x, 19, 255,255,255,200); }
+    for x in 7..19usize { set(&mut px, x, 23, 255,255,255,200); set(&mut px, x, 24, 255,255,255,200); }
     px
 }
