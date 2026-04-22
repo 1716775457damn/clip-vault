@@ -8,6 +8,8 @@ mod sync_state;
 mod sync_syncer;
 mod sync_watcher;
 mod theme;
+#[cfg(target_os = "windows")]
+mod win_capture;
 
 use app::{App, TrayMsg};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, hotkey::{Code, HotKey, Modifiers}};

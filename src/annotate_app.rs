@@ -153,6 +153,13 @@ pub struct AnnotateApp {
     editing_hotkey:  bool,
     hotkey_buf:      String,
 
+    // Smart window detection (Windows only)
+    /// Highlighted window rect under cursor during selection (logical px)
+    smart_rect:      Option<[i32; 4]>,
+    /// Low-level mouse hook active during selection
+    #[cfg(target_os = "windows")]
+    mouse_hook:      Option<crate::win_capture::LowLevelMouseHook>,
+
     status:          String,
 }
 
@@ -170,6 +177,9 @@ impl Default for AnnotateApp {
             drag_start: None, cur_drag: None, pen_points: Vec::new(),
             hotkey: HotkeyConfig::load(),
             editing_hotkey: false, hotkey_buf: String::new(),
+            smart_rect: None,
+            #[cfg(target_os = "windows")]
+            mouse_hook: None,
             status: String::new(),
         }
     }
@@ -189,8 +199,12 @@ impl AnnotateApp {
                             self.full_texture = None;
                             self.sel_start = None;
                             self.sel_cur   = None;
+                            self.smart_rect = None;
                             self.capture_state = CaptureState::Selecting;
-                            self.status = "拖拽选择截图区域，Esc 取消".to_string();
+                            self.status = "拖拽手动框选  或  悬停窗口后单击智能框选  •  Esc 取消".to_string();
+                            // Install low-level mouse hook for precise events
+                            #[cfg(target_os = "windows")]
+                            { self.mouse_hook = crate::win_capture::LowLevelMouseHook::install(); }
                         }
                         Err(e) => { self.status = format!("截图失败: {e}"); }
                     }
@@ -202,33 +216,56 @@ impl AnnotateApp {
         }
     }
 
-    /// Step 2: crop the selected region and enter editing mode.
     fn commit_selection(&mut self, ctx: &egui::Context) {
-        let (s, e) = match (self.sel_start, self.sel_cur) {
-            (Some(s), Some(e)) => (s, e),
-            _ => return,
-        };
-        let base = match self.full_pixels.as_ref() { Some(p) => p, None => return };
+        // Uninstall hook
+        #[cfg(target_os = "windows")]
+        { self.mouse_hook = None; }
 
-        // Convert logical screen coords → pixel coords
-        let scale = ctx.pixels_per_point();
-        let x0 = (s.x.min(e.x) * scale) as usize;
-        let y0 = (s.y.min(e.y) * scale) as usize;
-        let x1 = ((s.x.max(e.x) * scale) as usize).min(self.full_w);
-        let y1 = ((s.y.max(e.y) * scale) as usize).min(self.full_h);
+        let (x0, y0, x1, y1): (i32, i32, i32, i32);
 
-        let cw = x1.saturating_sub(x0);
-        let ch = y1.saturating_sub(y0);
+        if let Some(sr) = self.smart_rect.take() {
+            // Smart selection: use window rect directly (already in screen pixels)
+            x0 = sr[0]; y0 = sr[1]; x1 = sr[2]; y1 = sr[3];
+        } else {
+            // Manual drag selection
+            let (s, e) = match (self.sel_start, self.sel_cur) {
+                (Some(s), Some(e)) => (s, e),
+                _ => return,
+            };
+            let scale = ctx.pixels_per_point();
+            x0 = (s.x.min(e.x) * scale) as i32;
+            y0 = (s.y.min(e.y) * scale) as i32;
+            x1 = ((s.x.max(e.x) * scale) as i32).min(self.full_w as i32);
+            y1 = ((s.y.max(e.y) * scale) as i32).min(self.full_h as i32);
+        }
+
+        let cw = (x1 - x0).max(0) as usize;
+        let ch = (y1 - y0).max(0) as usize;
         if cw < 4 || ch < 4 { return; }
 
-        // Crop RGBA
-        let mut cropped = vec![0u8; cw * ch * 4];
-        for row in 0..ch {
-            let src_off = ((y0 + row) * self.full_w + x0) * 4;
-            let dst_off = row * cw * 4;
-            cropped[dst_off..dst_off + cw * 4]
-                .copy_from_slice(&base[src_off..src_off + cw * 4]);
-        }
+        // Try GDI capture first (handles layered/fullscreen windows better)
+        // Fall back to cropping the already-captured full-screen buffer.
+        #[cfg(target_os = "windows")]
+        let cropped = crate::win_capture::capture_rect_gdi(x0, y0, cw as i32, ch as i32);
+        #[cfg(not(target_os = "windows"))]
+        let cropped: Option<Vec<u8>> = None;
+
+        let cropped = cropped.unwrap_or_else(|| {
+            // Fallback: crop from full-screen buffer
+            let base = match self.full_pixels.as_ref() { Some(p) => p, None => return vec![] };
+            let mut out = vec![0u8; cw * ch * 4];
+            for row in 0..ch {
+                let sy = (y0 as usize + row).min(self.full_h.saturating_sub(1));
+                let src_off = (sy * self.full_w + x0 as usize) * 4;
+                let dst_off = row * cw * 4;
+                let copy_len = (cw * 4).min(base.len().saturating_sub(src_off));
+                out[dst_off..dst_off + copy_len]
+                    .copy_from_slice(&base[src_off..src_off + copy_len]);
+            }
+            out
+        });
+
+        if cropped.is_empty() { return; }
 
         self.img_w   = cw;
         self.img_h   = ch;
@@ -240,8 +277,6 @@ impl AnnotateApp {
         self.texture_dirty = true;
         self.capture_state = CaptureState::Editing;
         self.status = format!("{}×{} — 选择工具开始标注", cw, ch);
-
-        // Release full-screen buffer
         self.full_pixels  = None;
         self.full_texture = None;
     }
@@ -298,16 +333,17 @@ impl AnnotateApp {
 
         // ── Full-screen selection overlay ─────────────────────────────────────
         if self.capture_state == CaptureState::Selecting {
-            // Esc cancels
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                #[cfg(target_os = "windows")]
+                { self.mouse_hook = None; }
                 self.capture_state = CaptureState::Idle;
                 self.full_pixels   = None;
                 self.full_texture  = None;
+                self.smart_rect    = None;
                 self.status        = String::new();
                 return false;
             }
 
-            // Upload full-screen texture once
             if self.full_texture.is_none() {
                 if let Some(ref px) = self.full_pixels {
                     let ci = ColorImage::from_rgba_unmultiplied([self.full_w, self.full_h], px);
@@ -315,7 +351,35 @@ impl AnnotateApp {
                 }
             }
 
-            // Render overlay panel covering the whole screen
+            // Poll low-level mouse hook for cursor position and clicks
+            #[cfg(target_os = "windows")]
+            let (hook_pos, hook_clicked) = {
+                let st = crate::win_capture::LowLevelMouseHook::poll();
+                (Some(st.pos), st.clicked)
+            };
+            #[cfg(not(target_os = "windows"))]
+            let (hook_pos, hook_clicked): (Option<(i32,i32)>, bool) = (None, false);
+
+            // Update smart rect from hook cursor position (outside egui window)
+            if self.sel_start.is_none() {
+                if let Some((hx, hy)) = hook_pos {
+                    #[cfg(target_os = "windows")]
+                    {
+                        self.smart_rect = crate::win_capture::hovered_window_rect(hx, hy);
+                    }
+                }
+            }
+
+            // Smart click: single click selects the hovered window
+            if hook_clicked && self.sel_start.is_none() {
+                #[cfg(target_os = "windows")]
+                crate::win_capture::LowLevelMouseHook::consume_click();
+                if self.smart_rect.is_some() {
+                    self.commit_selection(ctx);
+                    return false;
+                }
+            }
+
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ctx, |ui| {
@@ -323,20 +387,52 @@ impl AnnotateApp {
                 let (overlay_rect, resp) = ui.allocate_exact_size(avail, egui::Sense::drag());
                 let painter = ui.painter_at(overlay_rect);
 
-                // Draw full-screen screenshot as background
                 if let Some(ref tex) = self.full_texture {
                     painter.image(tex.id(), overlay_rect,
-                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                        Color32::WHITE);
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
                 }
-
-                // Dim overlay
                 painter.rect_filled(overlay_rect, 0.0, Color32::from_black_alpha(80));
 
-                // Drag to select
+                let scale = ctx.pixels_per_point();
+
+                // Draw smart-detect highlight (window under cursor)
+                if self.sel_start.is_none() {
+                    if let Some(sr) = self.smart_rect {
+                        let r = Rect::from_min_max(
+                            Pos2::new(sr[0] as f32 / scale, sr[1] as f32 / scale),
+                            Pos2::new(sr[2] as f32 / scale, sr[3] as f32 / scale),
+                        );
+                        // Un-dim the smart rect
+                        if let Some(ref tex) = self.full_texture {
+                            let uv = Rect::from_min_max(
+                                Pos2::new((r.min.x - overlay_rect.min.x) / overlay_rect.width(),
+                                          (r.min.y - overlay_rect.min.y) / overlay_rect.height()),
+                                Pos2::new((r.max.x - overlay_rect.min.x) / overlay_rect.width(),
+                                          (r.max.y - overlay_rect.min.y) / overlay_rect.height()),
+                            );
+                            painter.image(tex.id(), r, uv, Color32::WHITE);
+                        }
+                        // Cyan border
+                        painter.rect_stroke(r, 0.0,
+                            Stroke::new(2.0, Color32::from_rgb(56, 189, 248)),
+                            egui::StrokeKind::Outside);
+                        // Size label
+                        let pw = sr[2] - sr[0]; let ph = sr[3] - sr[1];
+                        painter.text(
+                            r.max + Vec2::new(4.0, -14.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("{}×{}  单击确认", pw, ph),
+                            egui::FontId::proportional(12.0),
+                            Color32::from_rgb(56, 189, 248),
+                        );
+                    }
+                }
+
+                // Manual drag
                 if resp.drag_started() {
-                    self.sel_start = resp.interact_pointer_pos();
-                    self.sel_cur   = self.sel_start;
+                    self.sel_start  = resp.interact_pointer_pos();
+                    self.sel_cur    = self.sel_start;
+                    self.smart_rect = None;
                 }
                 if resp.dragged() {
                     self.sel_cur = resp.interact_pointer_pos();
@@ -348,30 +444,20 @@ impl AnnotateApp {
                     return;
                 }
 
-                // Draw selection rectangle
+                // Draw manual selection rect
                 if let (Some(s), Some(e)) = (self.sel_start, self.sel_cur) {
                     let sel_rect = Rect::from_two_pos(s, e);
-                    // Un-dim the selected area
-                    painter.rect_filled(sel_rect, 0.0, Color32::TRANSPARENT);
-                    // Re-draw screenshot inside selection (clear the dim)
                     if let Some(ref tex) = self.full_texture {
-                        let uv_min = Pos2::new(
-                            (sel_rect.min.x - overlay_rect.min.x) / overlay_rect.width(),
-                            (sel_rect.min.y - overlay_rect.min.y) / overlay_rect.height(),
+                        let uv = Rect::from_min_max(
+                            Pos2::new((sel_rect.min.x - overlay_rect.min.x) / overlay_rect.width(),
+                                      (sel_rect.min.y - overlay_rect.min.y) / overlay_rect.height()),
+                            Pos2::new((sel_rect.max.x - overlay_rect.min.x) / overlay_rect.width(),
+                                      (sel_rect.max.y - overlay_rect.min.y) / overlay_rect.height()),
                         );
-                        let uv_max = Pos2::new(
-                            (sel_rect.max.x - overlay_rect.min.x) / overlay_rect.width(),
-                            (sel_rect.max.y - overlay_rect.min.y) / overlay_rect.height(),
-                        );
-                        painter.image(tex.id(), sel_rect,
-                            Rect::from_min_max(uv_min, uv_max), Color32::WHITE);
+                        painter.image(tex.id(), sel_rect, uv, Color32::WHITE);
                     }
-                    // Border
                     painter.rect_stroke(sel_rect, 0.0,
-                        Stroke::new(2.0, Color32::from_rgb(56, 189, 248)),
-                        egui::StrokeKind::Outside);
-                    // Size hint
-                    let scale = ctx.pixels_per_point();
+                        Stroke::new(2.0, Color32::WHITE), egui::StrokeKind::Outside);
                     let pw = ((sel_rect.width()  * scale) as u32).max(0);
                     let ph = ((sel_rect.height() * scale) as u32).max(0);
                     painter.text(
@@ -383,14 +469,18 @@ impl AnnotateApp {
                     );
                 }
 
-                // Hint text
-                painter.text(
-                    overlay_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    if self.sel_start.is_none() { "拖拽选择截图区域  •  Esc 取消" } else { "" },
-                    egui::FontId::proportional(18.0),
-                    Color32::WHITE,
-                );
+                // Hint
+                if self.sel_start.is_none() && self.smart_rect.is_none() {
+                    painter.text(
+                        overlay_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "拖拽手动框选  或  悬停到窗口上单击智能框选  •  Esc 取消",
+                        egui::FontId::proportional(16.0),
+                        Color32::WHITE,
+                    );
+                }
+
+                ctx.request_repaint();
             });
             return false;
         }
