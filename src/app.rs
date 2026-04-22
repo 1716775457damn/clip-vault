@@ -863,7 +863,6 @@ pub struct App {
     sync:     SyncApp,
     annotate: AnnotateApp,
     is_dark:  bool,
-    annotate_was_selecting:   bool,
     pub hotkey_triggered: Arc<AtomicBool>,
     pub tray_rx: std::sync::mpsc::Receiver<TrayMsg>,
 }
@@ -881,7 +880,6 @@ impl App {
             sync:     SyncApp::default(),
             annotate: AnnotateApp::default(),
             is_dark:  true,
-            annotate_was_selecting:   false,
             hotkey_triggered,
             tray_rx,
         }
@@ -972,17 +970,19 @@ impl eframe::App for App {
             Tab::Annotate => {
                 let want_capture = self.annotate.update(ctx);
                 if want_capture {
+                    // Record own HWNDs BEFORE minimising
+                    self.annotate.start_capture();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                    self.annotate.capture_pending = 3;
                     ctx.request_repaint();
                 }
-                // Restore window and go fullscreen once selecting starts
-                if self.annotate.is_selecting() && !self.annotate_was_selecting {
+                // Poll for capture result from background thread
+                if self.annotate.poll_capture() {
+                    // Capture ready: restore window and go fullscreen for overlay
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    ctx.request_repaint();
                 }
-                self.annotate_was_selecting = self.annotate.is_selecting();
                 self.annotate.editing_panel(ctx);
             }
         }

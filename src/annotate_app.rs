@@ -10,6 +10,8 @@ pub struct Annotation {
     pub p1: Pos2, pub p2: Pos2, pub pen_points: Vec<Pos2>,
 }
 
+// ── Hotkey ────────────────────────────────────────────────────────────────────
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct HotkeyConfig {
     pub ctrl: bool, pub shift: bool, pub alt: bool, pub key: String,
@@ -68,13 +70,25 @@ const PALETTE: &[Color32] = &[
 #[derive(PartialEq)]
 enum CaptureState { Idle, Selecting, Editing }
 
+// ── Capture result channel ────────────────────────────────────────────────────
+
+/// Sent from the background capture thread to the UI thread.
+pub struct CaptureResult {
+    pub pixels: Vec<u8>,
+    pub width:  usize,
+    pub height: usize,
+}
+
 pub struct AnnotateApp {
     capture_state: CaptureState,
-    full_pixels:   Option<Vec<u8>>,
+
+    // Full-screen buffer for the selection overlay
+    full_pixels:  Option<Vec<u8>>,
     full_w: usize, full_h: usize,
-    full_texture:  Option<TextureHandle>,
+    full_texture: Option<TextureHandle>,
     sel_start: Option<Pos2>, sel_cur: Option<Pos2>,
 
+    // Cropped editing buffer
     pixels: Option<Vec<u8>>,
     img_w: usize, img_h: usize,
     baked: Option<Vec<u8>>,
@@ -87,19 +101,22 @@ pub struct AnnotateApp {
     tool: ShapeKind, color: Color32, stroke_w: f32, filled: bool,
     drag_start: Option<Pos2>, cur_drag: Option<Pos2>, pen_points: Vec<Pos2>,
 
-    pub hotkey:      HotkeyConfig,
-    editing_hotkey:  bool,
+    pub hotkey:     HotkeyConfig,
+    editing_hotkey: bool,
 
     smart_rect: Option<[i32; 4]>,
+
+    // Windows-only: process HWNDs for exclusion, mouse hook
     #[cfg(target_os = "windows")]
-    own_hwnd: isize,
+    own_hwnds: Vec<isize>,
     #[cfg(target_os = "windows")]
     mouse_hook: Option<crate::win_capture::LowLevelMouseHook>,
 
-    /// Counts down frames after window hide before grabbing screen
-    pub capture_pending: u8,
-    /// Set when the capture button is clicked in the settings panel
+    /// Channel receiver for background capture results
+    capture_rx: Option<std::sync::mpsc::Receiver<CaptureResult>>,
+    /// Set by button click; checked at end of update()
     pub capture_btn_clicked: bool,
+
     status: String,
 }
 
@@ -116,9 +133,9 @@ impl Default for AnnotateApp {
             drag_start: None, cur_drag: None, pen_points: Vec::new(),
             hotkey: HotkeyConfig::load(), editing_hotkey: false,
             smart_rect: None,
-            #[cfg(target_os = "windows")] own_hwnd: 0,
+            #[cfg(target_os = "windows")] own_hwnds: Vec::new(),
             #[cfg(target_os = "windows")] mouse_hook: None,
-            capture_pending: 0,
+            capture_rx: None,
             capture_btn_clicked: false,
             status: String::new(),
         }
@@ -128,29 +145,61 @@ impl Default for AnnotateApp {
 impl AnnotateApp {
     pub fn is_selecting(&self) -> bool { self.capture_state == CaptureState::Selecting }
 
-    pub fn grab_fullscreen(&mut self) {
-        match screenshots::Screen::all() {
-            Ok(screens) => {
-                if let Some(screen) = screens.into_iter().next() {
-                    match screen.capture() {
-                        Ok(img) => {
-                            self.full_w = img.width() as usize;
-                            self.full_h = img.height() as usize;
-                            self.full_pixels = Some(img.into_raw());
-                            self.full_texture = None;
-                            self.sel_start = None; self.sel_cur = None; self.smart_rect = None;
-                            self.capture_state = CaptureState::Selecting;
-                            self.status = "拖拽手动框选  或  悬停窗口后单击智能框选  •  Esc 取消".to_string();
-                            #[cfg(target_os = "windows")] {
-                                self.own_hwnd = crate::win_capture::get_own_hwnd();
-                                self.mouse_hook = crate::win_capture::LowLevelMouseHook::install();
-                            }
-                        }
-                        Err(e) => { self.status = format!("截图失败: {e}"); }
-                    }
-                } else { self.status = "未找到显示器".to_string(); }
+    /// Called by App BEFORE minimising the window.
+    /// Records own HWNDs and spawns a background thread to capture after a delay.
+    pub fn start_capture(&mut self) {
+        // Record our own process HWNDs now, while the window is still visible
+        #[cfg(target_os = "windows")]
+        { self.own_hwnds = crate::win_capture::get_process_hwnds(); }
+
+        let (tx, rx) = std::sync::mpsc::channel::<CaptureResult>();
+        self.capture_rx = Some(rx);
+
+        // Spawn background thread: sleep to let window hide, then capture
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+
+            #[cfg(target_os = "windows")]
+            {
+                if let Some((pixels, w, h)) = crate::win_capture::capture_fullscreen() {
+                    let _ = tx.send(CaptureResult { pixels, width: w, height: h });
+                    return;
+                }
             }
-            Err(e) => { self.status = format!("截图失败: {e}"); }
+
+            // Non-Windows fallback via screenshots crate
+            if let Ok(screens) = screenshots::Screen::all() {
+                if let Some(screen) = screens.into_iter().next() {
+                    if let Ok(img) = screen.capture() {
+                        let w = img.width() as usize;
+                        let h = img.height() as usize;
+                        let _ = tx.send(CaptureResult { pixels: img.into_raw(), width: w, height: h });
+                    }
+                }
+            }
+        });
+    }
+
+    /// Poll the capture channel. Returns true when capture is ready and
+    /// the overlay should be shown (caller should restore + fullscreen the window).
+    pub fn poll_capture(&mut self) -> bool {
+        let rx = match self.capture_rx.as_ref() { Some(r) => r, None => return false };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.full_w = result.width;
+                self.full_h = result.height;
+                self.full_pixels = Some(result.pixels);
+                self.full_texture = None;
+                self.sel_start = None; self.sel_cur = None; self.smart_rect = None;
+                self.capture_state = CaptureState::Selecting;
+                self.capture_rx = None;
+                self.status = "拖拽手动框选  或  悬停窗口后单击智能框选  •  Esc 取消".to_string();
+                #[cfg(target_os = "windows")]
+                { self.mouse_hook = crate::win_capture::LowLevelMouseHook::install(); }
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(_) => { self.capture_rx = None; false }
         }
     }
 
@@ -161,7 +210,7 @@ impl AnnotateApp {
         if let Some(sr) = self.smart_rect.take() {
             x0 = sr[0]; y0 = sr[1]; x1 = sr[2]; y1 = sr[3];
         } else {
-            let (s, e) = match (self.sel_start, self.sel_cur) { (Some(s),Some(e)) => (s,e), _ => return };
+            let (s, e) = match (self.sel_start, self.sel_cur) { (Some(s),Some(e))=>(s,e), _=>return };
             let sc = ctx.pixels_per_point();
             x0 = (s.x.min(e.x) * sc) as i32; y0 = (s.y.min(e.y) * sc) as i32;
             x1 = ((s.x.max(e.x) * sc) as i32).min(self.full_w as i32);
@@ -171,12 +220,14 @@ impl AnnotateApp {
         let ch = (y1 - y0).max(0) as usize;
         if cw < 4 || ch < 4 { return; }
 
+        // Use GDI for a fresh capture of the exact rect (avoids stale full-screen buffer)
         #[cfg(target_os = "windows")]
         let cropped = crate::win_capture::capture_rect_gdi(x0, y0, cw as i32, ch as i32);
         #[cfg(not(target_os = "windows"))]
         let cropped: Option<Vec<u8>> = None;
 
         let cropped = cropped.unwrap_or_else(|| {
+            // Fallback: crop from full-screen buffer
             let base = match self.full_pixels.as_ref() { Some(p) => p, None => return vec![] };
             let mut out = vec![0u8; cw * ch * 4];
             for row in 0..ch {
@@ -233,14 +284,6 @@ impl AnnotateApp {
 
     /// Returns true when the window should be hidden to start capture.
     pub fn update(&mut self, ctx: &egui::Context) -> bool {
-        // ── Pending: count down frames after window hide ──────────────────────
-        if self.capture_pending > 0 {
-            self.capture_pending -= 1;
-            if self.capture_pending == 0 { self.grab_fullscreen(); }
-            ctx.request_repaint();
-            return false;
-        }
-
         // ── Hotkey ────────────────────────────────────────────────────────────
         if self.capture_state == CaptureState::Idle && !self.editing_hotkey {
             if self.hotkey.matches(ctx) { return true; }
@@ -265,7 +308,7 @@ impl AnnotateApp {
                 }
             }
 
-            // Poll hook
+            // Poll hook for smart detection
             #[cfg(target_os = "windows")]
             let (hook_pos, hook_clicked) = {
                 let st = crate::win_capture::LowLevelMouseHook::poll();
@@ -274,11 +317,10 @@ impl AnnotateApp {
             #[cfg(not(target_os = "windows"))]
             let (hook_pos, hook_clicked): (Option<(i32,i32)>, bool) = (None, false);
 
-            // Smart window detection
             if self.sel_start.is_none() {
                 if let Some((hx, hy)) = hook_pos {
                     #[cfg(target_os = "windows")]
-                    { self.smart_rect = crate::win_capture::hovered_window_rect(hx, hy, self.own_hwnd); }
+                    { self.smart_rect = crate::win_capture::hovered_window_rect(hx, hy, &self.own_hwnds); }
                 }
             }
 
@@ -402,11 +444,7 @@ impl AnnotateApp {
             });
         });
 
-        // Check capture button flag
-        if self.capture_btn_clicked {
-            self.capture_btn_clicked = false;
-            return true;
-        }
+        if self.capture_btn_clicked { self.capture_btn_clicked = false; return true; }
         false
     }
 
@@ -480,7 +518,6 @@ impl AnnotateApp {
                             width: self.stroke_w, filled: self.filled, p1: s, p2: e, pen_points: Vec::new() }, 1.0, &to_screen);
                     }
                 }
-                // Inline toolbar below image
                 ui.add_space(6.0);
                 egui::Frame::new().fill(Color32::from_rgba_unmultiplied(20,22,30,230))
                     .corner_radius(8.0).inner_margin(egui::Margin { left:8,right:8,top:6,bottom:6 })
@@ -540,6 +577,8 @@ impl AnnotateApp {
     }
 } // end impl AnnotateApp
 
+// ── egui painter helpers ──────────────────────────────────────────────────────
+
 fn draw_annotation_egui(painter: &egui::Painter, ann: &Annotation, scale: f32, to_screen: &impl Fn(Pos2)->Pos2) {
     let stroke = Stroke::new(ann.width * scale, ann.color);
     match ann.kind {
@@ -559,6 +598,8 @@ fn draw_annotation_egui(painter: &egui::Painter, ann: &Annotation, scale: f32, t
         ShapeKind::Pen => { for pair in ann.pen_points.windows(2) { painter.line_segment([to_screen(pair[0]),to_screen(pair[1])], stroke); } }
     }
 }
+
+// ── Pixel-level drawing ───────────────────────────────────────────────────────
 
 pub fn render_annotation_to_buf(buf: &mut [u8], w: usize, h: usize, ann: &Annotation) {
     match ann.kind {
@@ -632,8 +673,17 @@ fn draw_arrow(buf:&mut[u8],w:usize,h:usize,p1:Pos2,p2:Pos2,c:Color32,lw:i32) {
     let len=(dx*dx+dy*dy).sqrt().max(1.0);
     let (ux,uy)=(dx/len,dy/len);
     let (head,angle)=(18.0_f32,0.4_f32);
-    let ax1=Pos2::new(p2.x-head*(ux*angle.cos()+uy*angle.sin()),p2.y-head*(-ux*angle.sin()+uy*angle.cos()));
-    let ax2=Pos2::new(p2.x-head*(ux*angle.cos()-uy*angle.sin()),p2.y-head*(ux*angle.sin()+uy*angle.cos()));
+    // Correct arrowhead: rotate unit vector ±angle around tip
+    // Wing 1: rotate +angle (clockwise in screen coords)
+    let ax1=Pos2::new(
+        p2.x - head*(ux*angle.cos() - uy*angle.sin()),
+        p2.y - head*(ux*angle.sin() + uy*angle.cos()),
+    );
+    // Wing 2: rotate -angle (counter-clockwise)
+    let ax2=Pos2::new(
+        p2.x - head*(ux*angle.cos() + uy*angle.sin()),
+        p2.y - head*(-ux*angle.sin() + uy*angle.cos()),
+    );
     draw_line_thick(buf,w,h,p2,ax1,c,lw);
     draw_line_thick(buf,w,h,p2,ax2,c,lw);
 }

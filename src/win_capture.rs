@@ -17,29 +17,68 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW,
 };
 
+// ── Own-window detection ──────────────────────────────────────────────────────
+
+/// Enumerate all HWNDs belonging to the current process.
+/// Used to exclude our own overlay from smart detection.
+pub fn get_process_hwnds() -> Vec<isize> {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId,
+    };
+    use windows::Win32::Foundation::{BOOL, LPARAM, TRUE};
+
+    let results: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+    unsafe {
+        let pid = GetCurrentProcessId();
+        let ptr = &results as *const Mutex<Vec<isize>> as isize;
+
+        unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let mut win_pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut win_pid));
+            let results = &*(lparam.0 as *const Mutex<Vec<isize>>);
+            if let Ok(mut v) = results.lock() {
+                // Store all HWNDs from our process
+                v.push(hwnd.0 as isize);
+            }
+            TRUE
+        }
+
+        // We can't easily filter by PID in the callback without capturing,
+        // so collect all and filter after
+        let _ = EnumWindows(Some(cb), LPARAM(ptr));
+
+        // Filter to only our process
+        let mut all = results.lock().unwrap();
+        let mut our: Vec<isize> = Vec::new();
+        for &h in all.iter() {
+            let mut win_pid = 0u32;
+            GetWindowThreadProcessId(HWND(h as *mut _), Some(&mut win_pid));
+            if win_pid == pid { our.push(h); }
+        }
+        our
+    }
+}
+
 // ── Smart window detection ────────────────────────────────────────────────────
 
 /// Find the best window to highlight under the given screen point.
-///
-/// Strategy (matches Snipaste / ShareX behaviour):
-/// 1. Get the top-level window under the cursor via `WindowFromPoint`.
-/// 2. Walk up to the root owner to avoid highlighting child controls by default.
-/// 3. Filter out: invisible, minimised, tool windows, transparent overlays,
-///    zero-size windows, and the caller's own HWND.
-/// 4. Return the window's screen rect in physical pixels.
-pub fn hovered_window_rect(screen_x: i32, screen_y: i32, own_hwnd: isize) -> Option<[i32; 4]> {
+/// Excludes any window belonging to our own process.
+pub fn hovered_window_rect(screen_x: i32, screen_y: i32, own_hwnds: &[isize]) -> Option<[i32; 4]> {
     unsafe {
         let pt = POINT { x: screen_x, y: screen_y };
         let hwnd = WindowFromPoint(pt);
         if hwnd.0.is_null() { return None; }
 
-        // Skip our own overlay window
-        if hwnd.0 as isize == own_hwnd { return None; }
-
-        // Walk up to the root (non-child) window — avoids tiny child controls
+        // Walk up to root ancestor
         let root = get_ancestor_root(hwnd);
 
-        // Filter: must be visible, not minimised
+        // Skip any window belonging to our process
+        if own_hwnds.contains(&(root.0 as isize)) { return None; }
+        if own_hwnds.contains(&(hwnd.0 as isize))  { return None; }
+
+        // Must be visible and not minimised
         if !IsWindowVisible(root).as_bool() { return None; }
         if IsIconic(root).as_bool()         { return None; }
 
@@ -58,25 +97,15 @@ pub fn hovered_window_rect(screen_x: i32, screen_y: i32, own_hwnd: isize) -> Opt
     }
 }
 
-/// Walk up the window hierarchy to find the root ancestor (non-child window).
 unsafe fn get_ancestor_root(hwnd: HWND) -> HWND {
     use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GA_ROOT};
     let root = GetAncestor(hwnd, GA_ROOT);
     if root.0.is_null() { hwnd } else { root }
 }
 
-/// Get the HWND of the foreground window (used to identify our own window).
-pub fn get_own_hwnd() -> isize {
-    unsafe {
-        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-        GetForegroundWindow().0 as isize
-    }
-}
-
 // ── GDI capture ───────────────────────────────────────────────────────────────
 
 /// Capture a screen rectangle using GDI BitBlt + CAPTUREBLT.
-/// Handles layered windows, full-screen apps, and DPI scaling correctly.
 /// Returns RGBA bytes (width × height × 4).
 pub fn capture_rect_gdi(left: i32, top: i32, width: i32, height: i32) -> Option<Vec<u8>> {
     if width <= 0 || height <= 0 { return None; }
@@ -88,13 +117,11 @@ pub fn capture_rect_gdi(left: i32, top: i32, width: i32, height: i32) -> Option<
         let bmp: HBITMAP = CreateCompatibleBitmap(screen_dc, width, height);
         let old = SelectObject(mem_dc, bmp);
 
-        // SRCCOPY | CAPTUREBLT — includes layered (WS_EX_LAYERED) windows
         const CAPTUREBLT: u32 = 0x4000_0000;
         const SRCCOPY_VAL: u32 = 0x00CC_0020;
         let _ = BitBlt(mem_dc, 0, 0, width, height,
                        screen_dc, left, top, ROP_CODE(SRCCOPY_VAL | CAPTUREBLT));
 
-        // Read pixels via GetDIBits
         use windows::Win32::Graphics::Gdi::{
             GetDIBits, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, BI_RGB,
         };
@@ -102,7 +129,7 @@ pub fn capture_rect_gdi(left: i32, top: i32, width: i32, height: i32) -> Option<
             bmiHeader: BITMAPINFOHEADER {
                 biSize:        std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth:       width,
-                biHeight:      -height, // top-down DIB
+                biHeight:      -height,
                 biPlanes:      1,
                 biBitCount:    32,
                 biCompression: BI_RGB.0,
@@ -114,7 +141,6 @@ pub fn capture_rect_gdi(left: i32, top: i32, width: i32, height: i32) -> Option<
         GetDIBits(mem_dc, bmp, 0, height as u32,
                   Some(bgra.as_mut_ptr() as *mut _), &mut bmi, DIB_RGB_COLORS);
 
-        // BGRA → RGBA in-place
         for chunk in bgra.chunks_exact_mut(4) {
             chunk.swap(0, 2);
             chunk[3] = 255;
@@ -127,6 +153,14 @@ pub fn capture_rect_gdi(left: i32, top: i32, width: i32, height: i32) -> Option<
 
         Some(bgra)
     }
+}
+
+/// Capture the full primary screen. Returns (pixels, width, height).
+pub fn capture_fullscreen() -> Option<(Vec<u8>, usize, usize)> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    let pixels = capture_rect_gdi(0, 0, w, h)?;
+    Some((pixels, w as usize, h as usize))
 }
 
 // ── Low-level mouse hook ──────────────────────────────────────────────────────
@@ -144,6 +178,8 @@ pub struct LowLevelMouseHook {
 }
 
 impl LowLevelMouseHook {
+    /// Install WH_MOUSE_LL on the calling thread.
+    /// Must be called from the main thread (which has a message loop via winit).
     pub fn install() -> Option<Self> {
         unsafe {
             *HOOK_STATE.lock().unwrap() = Some(MouseState::default());
