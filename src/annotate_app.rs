@@ -1,6 +1,8 @@
 use eframe::egui;
 use egui::{Color32, ColorImage, Key, Pos2, Rect, Stroke, TextureHandle, Vec2};
 
+// ── Shape types ───────────────────────────────────────────────────────────────
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum ShapeKind { Rect, Ellipse, Arrow, Pen }
 
@@ -17,7 +19,7 @@ pub struct HotkeyConfig {
     pub ctrl: bool, pub shift: bool, pub alt: bool, pub key: String,
 }
 impl Default for HotkeyConfig {
-    fn default() -> Self { Self { ctrl: true, shift: true, alt: false, key: "S".to_string() } }
+    fn default() -> Self { Self { ctrl: false, shift: false, alt: false, key: "F1".to_string() } }
 }
 impl HotkeyConfig {
     pub fn label(&self) -> String {
@@ -49,9 +51,7 @@ impl HotkeyConfig {
         hotkey_path().and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
     }
-    /// Public alias for use in main.rs before App is constructed.
     pub fn load_static() -> Self { Self::load() }
-
     fn save(&self) {
         if let Some(p) = hotkey_path() {
             let _ = std::fs::create_dir_all(p.parent().unwrap());
@@ -59,8 +59,6 @@ impl HotkeyConfig {
         }
     }
     pub fn save_pub(&self) { self.save(); }
-
-    /// Convert to a `global-hotkey` HotKey for system-level registration.
     pub fn to_global_hotkey(&self) -> global_hotkey::hotkey::HotKey {
         use global_hotkey::hotkey::{Code, HotKey, Modifiers};
         let mut mods = Modifiers::empty();
@@ -78,15 +76,33 @@ impl HotkeyConfig {
             "F1"=>Code::F1,"F2"=>Code::F2,"F3"=>Code::F3,"F4"=>Code::F4,
             "F5"=>Code::F5,"F6"=>Code::F6,"F7"=>Code::F7,"F8"=>Code::F8,
             "F9"=>Code::F9,"F10"=>Code::F10,"F11"=>Code::F11,"F12"=>Code::F12,
-            _ => Code::KeyS, // fallback
+            _ => Code::F1,
         };
         HotKey::new(if mods.is_empty() { None } else { Some(mods) }, code)
     }
-} // end impl HotkeyConfig
-
+}
 fn hotkey_path() -> Option<std::path::PathBuf> {
     Some(dirs::data_local_dir()?.join("clip-vault").join("hotkey.json"))
 }
+
+// ── Color format ──────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum ColorFmt { Hex, Rgb }
+
+impl ColorFmt {
+    fn format(self, c: Color32) -> String {
+        match self {
+            ColorFmt::Hex => format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b()),
+            ColorFmt::Rgb => format!("rgb({},{},{})", c.r(), c.g(), c.b()),
+        }
+    }
+    fn toggle(self) -> Self {
+        match self { ColorFmt::Hex => ColorFmt::Rgb, ColorFmt::Rgb => ColorFmt::Hex }
+    }
+}
+
+// ── Palette ───────────────────────────────────────────────────────────────────
 
 const PALETTE: &[Color32] = &[
     Color32::from_rgb(239,68,68), Color32::from_rgb(249,115,22),
@@ -95,28 +111,48 @@ const PALETTE: &[Color32] = &[
     Color32::from_rgb(236,72,153), Color32::WHITE, Color32::BLACK,
 ];
 
+// ── Capture history ───────────────────────────────────────────────────────────
+
+const MAX_HISTORY: usize = 10;
+
+struct HistoryEntry {
+    pixels: Vec<u8>,
+    w: usize, h: usize,
+}
+
+// ── State machine ─────────────────────────────────────────────────────────────
+
 #[derive(PartialEq)]
 enum CaptureState { Idle, Selecting, Editing }
 
-// ── Capture result channel ────────────────────────────────────────────────────
-
-/// Sent from the background capture thread to the UI thread.
 pub struct CaptureResult {
     pub pixels: Vec<u8>,
     pub width:  usize,
     pub height: usize,
 }
 
+// ── Main struct ───────────────────────────────────────────────────────────────
+
 pub struct AnnotateApp {
     capture_state: CaptureState,
 
-    // Full-screen buffer for the selection overlay
+    // Full-screen buffer
     full_pixels:  Option<Vec<u8>>,
     full_w: usize, full_h: usize,
     full_texture: Option<TextureHandle>,
-    sel_start: Option<Pos2>, sel_cur: Option<Pos2>,
 
-    // Cropped editing buffer
+    // Selection state (logical px)
+    sel_start: Option<Pos2>, sel_cur: Option<Pos2>,
+    /// Cursor position in physical screen pixels (from hook or mouse)
+    cursor_px: (i32, i32),
+    /// Show magnifier
+    show_magnifier: bool,
+    /// Color format for picker
+    color_fmt: ColorFmt,
+    /// Last picked color
+    picked_color: Option<Color32>,
+
+    // Editing buffer
     pixels: Option<Vec<u8>>,
     img_w: usize, img_h: usize,
     baked: Option<Vec<u8>>,
@@ -129,22 +165,21 @@ pub struct AnnotateApp {
     tool: ShapeKind, color: Color32, stroke_w: f32, filled: bool,
     drag_start: Option<Pos2>, cur_drag: Option<Pos2>, pen_points: Vec<Pos2>,
 
+    // Capture history (for , / . replay)
+    history: Vec<HistoryEntry>,
+    history_idx: Option<usize>, // None = current capture
+
     pub hotkey:     HotkeyConfig,
     editing_hotkey: bool,
-    /// Set when hotkey is saved, so App can re-register the global hotkey
     pub hotkey_changed: bool,
 
     smart_rect: Option<[i32; 4]>,
-
-    // Windows-only: process HWNDs for exclusion, mouse hook
     #[cfg(target_os = "windows")]
     own_hwnds: Vec<isize>,
     #[cfg(target_os = "windows")]
     mouse_hook: Option<crate::win_capture::LowLevelMouseHook>,
 
-    /// Channel receiver for background capture results
     capture_rx: Option<std::sync::mpsc::Receiver<CaptureResult>>,
-    /// Set by button click; checked at end of update()
     pub capture_btn_clicked: bool,
 
     status: String,
@@ -156,18 +191,19 @@ impl Default for AnnotateApp {
             capture_state: CaptureState::Idle,
             full_pixels: None, full_w: 0, full_h: 0, full_texture: None,
             sel_start: None, sel_cur: None,
+            cursor_px: (0, 0), show_magnifier: false,
+            color_fmt: ColorFmt::Hex, picked_color: None,
             pixels: None, img_w: 0, img_h: 0,
             baked: None, texture: None, texture_dirty: false,
             annotations: Vec::new(), undo_stack: Vec::new(),
             tool: ShapeKind::Rect, color: PALETTE[0], stroke_w: 3.0, filled: false,
             drag_start: None, cur_drag: None, pen_points: Vec::new(),
-            hotkey: HotkeyConfig::load(), editing_hotkey: false,
-            hotkey_changed: false,
+            history: Vec::new(), history_idx: None,
+            hotkey: HotkeyConfig::load(), editing_hotkey: false, hotkey_changed: false,
             smart_rect: None,
             #[cfg(target_os = "windows")] own_hwnds: Vec::new(),
             #[cfg(target_os = "windows")] mouse_hook: None,
-            capture_rx: None,
-            capture_btn_clicked: false,
+            capture_rx: None, capture_btn_clicked: false,
             status: String::new(),
         }
     }
@@ -176,55 +212,47 @@ impl Default for AnnotateApp {
 impl AnnotateApp {
     pub fn is_selecting(&self) -> bool { self.capture_state == CaptureState::Selecting }
 
-    /// Called by App BEFORE minimising the window.
-    /// Records own HWNDs and spawns a background thread to capture after a delay.
+    pub fn trigger_capture(&mut self) {
+        if self.capture_state == CaptureState::Idle { self.capture_btn_clicked = true; }
+    }
+
     pub fn start_capture(&mut self) {
-        // Record our own process HWNDs now, while the window is still visible
         #[cfg(target_os = "windows")]
         { self.own_hwnds = crate::win_capture::get_process_hwnds(); }
-
         let (tx, rx) = std::sync::mpsc::channel::<CaptureResult>();
         self.capture_rx = Some(rx);
-
-        // Spawn background thread: sleep to let window hide, then capture
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(300));
-
             #[cfg(target_os = "windows")]
-            {
-                if let Some((pixels, w, h)) = crate::win_capture::capture_fullscreen() {
-                    let _ = tx.send(CaptureResult { pixels, width: w, height: h });
-                    return;
-                }
+            if let Some((pixels, w, h)) = crate::win_capture::capture_fullscreen() {
+                let _ = tx.send(CaptureResult { pixels, width: w, height: h }); return;
             }
-
-            // Non-Windows fallback via screenshots crate
             if let Ok(screens) = screenshots::Screen::all() {
                 if let Some(screen) = screens.into_iter().next() {
                     if let Ok(img) = screen.capture() {
                         let w = img.width() as usize;
                         let h = img.height() as usize;
-                        let _ = tx.send(CaptureResult { pixels: img.into_raw(), width: w, height: h });
+                        let _ = tx.send(CaptureResult {
+                            pixels: img.into_raw(), width: w, height: h,
+                        });
                     }
                 }
             }
         });
     }
 
-    /// Poll the capture channel. Returns true when capture is ready and
-    /// the overlay should be shown (caller should restore + fullscreen the window).
     pub fn poll_capture(&mut self) -> bool {
         let rx = match self.capture_rx.as_ref() { Some(r) => r, None => return false };
         match rx.try_recv() {
             Ok(result) => {
-                self.full_w = result.width;
-                self.full_h = result.height;
+                self.full_w = result.width; self.full_h = result.height;
                 self.full_pixels = Some(result.pixels);
                 self.full_texture = None;
                 self.sel_start = None; self.sel_cur = None; self.smart_rect = None;
+                self.show_magnifier = false; self.picked_color = None;
                 self.capture_state = CaptureState::Selecting;
                 self.capture_rx = None;
-                self.status = "拖拽手动框选  或  悬停窗口后单击智能框选  •  Esc 取消".to_string();
+                self.status = "拖拽框选  •  悬停单击智能框选  •  WASD移动光标  •  Alt放大镜  •  C取色  •  Esc取消".to_string();
                 #[cfg(target_os = "windows")]
                 { self.mouse_hook = crate::win_capture::LowLevelMouseHook::install(); }
                 true
@@ -234,50 +262,71 @@ impl AnnotateApp {
         }
     }
 
+    /// Navigate capture history: delta = -1 (prev) or +1 (next)
+    fn history_navigate(&mut self, delta: i32) {
+        if self.history.is_empty() { return; }
+        let n = self.history.len() as i32;
+        let cur = self.history_idx.map(|i| i as i32).unwrap_or(n);
+        let new_idx = (cur - delta).clamp(0, n - 1) as usize;
+        if new_idx as i32 == cur { return; }
+        let entry = &self.history[new_idx];
+        self.img_w = entry.w; self.img_h = entry.h;
+        self.pixels = Some(entry.pixels.clone());
+        self.baked  = Some(entry.pixels.clone());
+        self.annotations.clear(); self.undo_stack.clear();
+        self.texture = None; self.texture_dirty = true;
+        self.capture_state = CaptureState::Editing;
+        self.history_idx = Some(new_idx);
+        self.status = format!("历史记录 {}/{}", new_idx + 1, self.history.len());
+    }
+
     fn commit_selection(&mut self, ctx: &egui::Context) {
         #[cfg(target_os = "windows")] { self.mouse_hook = None; }
-
         let (x0, y0, x1, y1): (i32, i32, i32, i32);
         if let Some(sr) = self.smart_rect.take() {
             x0 = sr[0]; y0 = sr[1]; x1 = sr[2]; y1 = sr[3];
         } else {
             let (s, e) = match (self.sel_start, self.sel_cur) { (Some(s),Some(e))=>(s,e), _=>return };
             let sc = ctx.pixels_per_point();
-            x0 = (s.x.min(e.x) * sc) as i32; y0 = (s.y.min(e.y) * sc) as i32;
-            x1 = ((s.x.max(e.x) * sc) as i32).min(self.full_w as i32);
-            y1 = ((s.y.max(e.y) * sc) as i32).min(self.full_h as i32);
+            x0 = (s.x.min(e.x)*sc) as i32; y0 = (s.y.min(e.y)*sc) as i32;
+            x1 = ((s.x.max(e.x)*sc) as i32).min(self.full_w as i32);
+            y1 = ((s.y.max(e.y)*sc) as i32).min(self.full_h as i32);
         }
-        let cw = (x1 - x0).max(0) as usize;
-        let ch = (y1 - y0).max(0) as usize;
+        let cw = (x1-x0).max(0) as usize; let ch = (y1-y0).max(0) as usize;
         if cw < 4 || ch < 4 { return; }
 
-        // Use GDI for a fresh capture of the exact rect (avoids stale full-screen buffer)
         #[cfg(target_os = "windows")]
         let cropped = crate::win_capture::capture_rect_gdi(x0, y0, cw as i32, ch as i32);
         #[cfg(not(target_os = "windows"))]
         let cropped: Option<Vec<u8>> = None;
 
         let cropped = cropped.unwrap_or_else(|| {
-            // Fallback: crop from full-screen buffer
-            let base = match self.full_pixels.as_ref() { Some(p) => p, None => return vec![] };
-            let mut out = vec![0u8; cw * ch * 4];
+            let base = match self.full_pixels.as_ref() { Some(p)=>p, None=>return vec![] };
+            let mut out = vec![0u8; cw*ch*4];
             for row in 0..ch {
-                let sy = (y0 as usize + row).min(self.full_h.saturating_sub(1));
-                let src = (sy * self.full_w + x0 as usize) * 4;
-                let dst = row * cw * 4;
-                let len = (cw * 4).min(base.len().saturating_sub(src));
+                let sy = (y0 as usize+row).min(self.full_h.saturating_sub(1));
+                let src = (sy*self.full_w + x0 as usize)*4;
+                let dst = row*cw*4;
+                let len = (cw*4).min(base.len().saturating_sub(src));
                 out[dst..dst+len].copy_from_slice(&base[src..src+len]);
             }
             out
         });
         if cropped.is_empty() { return; }
 
+        // Save to history
+        if self.history_idx.is_none() {
+            self.history.push(HistoryEntry { pixels: cropped.clone(), w: cw, h: ch });
+            if self.history.len() > MAX_HISTORY { self.history.remove(0); }
+        }
+        self.history_idx = None;
+
         self.img_w = cw; self.img_h = ch;
         self.pixels = Some(cropped.clone()); self.baked = Some(cropped);
         self.annotations.clear(); self.undo_stack.clear();
         self.texture = None; self.texture_dirty = true;
         self.capture_state = CaptureState::Editing;
-        self.status = format!("{}×{} — 选择工具开始标注", cw, ch);
+        self.status = format!("{}×{}  Enter复制  Ctrl+S保存  Esc关闭", cw, ch);
         self.full_pixels = None; self.full_texture = None;
     }
 
@@ -289,14 +338,14 @@ impl AnnotateApp {
     fn rebuild_baked(&mut self) {
         if let Some(ref base) = self.pixels {
             let mut buf = base.clone();
-            let (w, h) = (self.img_w, self.img_h);
+            let (w,h) = (self.img_w, self.img_h);
             for ann in &self.annotations { render_annotation_to_buf(&mut buf, w, h, ann); }
             self.baked = Some(buf);
         }
     }
     fn bake_last(&mut self) {
         if let (Some(ref mut baked), Some(ann)) = (&mut self.baked, self.annotations.last()) {
-            let (w, h) = (self.img_w, self.img_h);
+            let (w,h) = (self.img_w, self.img_h);
             render_annotation_to_buf(baked, w, h, ann);
         }
     }
@@ -313,24 +362,24 @@ impl AnnotateApp {
         Ok(())
     }
 
-    /// Called by App when the global screenshot hotkey fires.
-    /// Immediately starts capture without requiring window focus.
-    pub fn trigger_capture(&mut self) {
-        if self.capture_state == CaptureState::Idle {
-            self.capture_btn_clicked = true;
-        }
+    /// Sample pixel color from full-screen buffer at physical coords.
+    fn sample_color(&self, px: i32, py: i32) -> Option<Color32> {
+        let buf = self.full_pixels.as_ref()?;
+        let x = px.clamp(0, self.full_w as i32 - 1) as usize;
+        let y = py.clamp(0, self.full_h as i32 - 1) as usize;
+        let i = (y * self.full_w + x) * 4;
+        if i + 3 >= buf.len() { return None; }
+        Some(Color32::from_rgb(buf[i], buf[i+1], buf[i+2]))
     }
 
-    /// Returns true when the window should be hidden to start capture.
     pub fn update(&mut self, ctx: &egui::Context) -> bool {
-        // Hotkey is now handled externally via trigger_capture().
-        // Keep egui-based detection only as fallback when window has focus.
         if self.capture_state == CaptureState::Idle && !self.editing_hotkey {
             if self.hotkey.matches(ctx) { return true; }
         }
 
         // ── Selecting overlay ─────────────────────────────────────────────────
         if self.capture_state == CaptureState::Selecting {
+            // Esc = cancel
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 #[cfg(target_os = "windows")] { self.mouse_hook = None; }
                 self.capture_state = CaptureState::Idle;
@@ -348,7 +397,7 @@ impl AnnotateApp {
                 }
             }
 
-            // Poll hook for smart detection
+            // Poll hook
             #[cfg(target_os = "windows")]
             let (hook_pos, hook_clicked) = {
                 let st = crate::win_capture::LowLevelMouseHook::poll();
@@ -357,11 +406,75 @@ impl AnnotateApp {
             #[cfg(not(target_os = "windows"))]
             let (hook_pos, hook_clicked): (Option<(i32,i32)>, bool) = (None, false);
 
-            if self.sel_start.is_none() {
-                if let Some((hx, hy)) = hook_pos {
-                    #[cfg(target_os = "windows")]
-                    { self.smart_rect = crate::win_capture::hovered_window_rect(hx, hy, &self.own_hwnds); }
+            // Update cursor position from hook
+            if let Some((hx, hy)) = hook_pos { self.cursor_px = (hx, hy); }
+
+            // Alt toggles magnifier — detect Alt key press via key event
+            if ctx.input(|i| i.key_pressed(Key::F10)) { /* placeholder */ }
+            // Use a dedicated toggle: show magnifier when Alt is held
+            self.show_magnifier = ctx.input(|i| i.modifiers.alt);
+
+            // C = copy color (when magnifier visible)
+            if self.show_magnifier && ctx.input(|i| i.key_pressed(Key::C)) {
+                if let Some(c) = self.sample_color(self.cursor_px.0, self.cursor_px.1) {
+                    self.picked_color = Some(c);
+                    let s = self.color_fmt.format(c);
+                    let _ = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(s.clone()));
+                    self.status = format!("已复制颜色: {}", s);
                 }
+            }
+            // Shift = toggle color format (check key press via modifiers change)
+            if ctx.input(|i| i.key_pressed(Key::F) && i.modifiers.shift) {
+                self.color_fmt = self.color_fmt.toggle();
+            }
+
+            // History navigation: , = prev, . = next
+            if ctx.input(|i| i.key_pressed(Key::Comma))  { self.history_navigate(-1); return false; }
+            if ctx.input(|i| i.key_pressed(Key::Period))  { self.history_navigate(1);  return false; }
+
+            // WASD = move cursor by 1 physical pixel
+            let scale = ctx.pixels_per_point();
+            let (mut cx, mut cy) = self.cursor_px;
+            if ctx.input(|i| i.key_pressed(Key::W)) { cy -= 1; }
+            if ctx.input(|i| i.key_pressed(Key::S)) { cy += 1; }
+            if ctx.input(|i| i.key_pressed(Key::A)) { cx -= 1; }
+            if ctx.input(|i| i.key_pressed(Key::D)) { cx += 1; }
+            self.cursor_px = (cx, cy);
+
+            // Keyboard selection adjustment (when dragging started)
+            if self.sel_start.is_some() {
+                let step = 1.0 / scale; // 1 physical pixel in logical coords
+                let ctrl  = ctx.input(|i| i.modifiers.ctrl);
+                let shift = ctx.input(|i| i.modifiers.shift);
+                let mut dx = 0.0f32; let mut dy = 0.0f32;
+                if ctx.input(|i| i.key_pressed(Key::ArrowLeft))  { dx = -step; }
+                if ctx.input(|i| i.key_pressed(Key::ArrowRight)) { dx =  step; }
+                if ctx.input(|i| i.key_pressed(Key::ArrowUp))    { dy = -step; }
+                if ctx.input(|i| i.key_pressed(Key::ArrowDown))  { dy =  step; }
+                if dx != 0.0 || dy != 0.0 {
+                    if ctrl {
+                        // Expand selection
+                        if let Some(ref mut e) = self.sel_cur {
+                            e.x += dx; e.y += dy;
+                        }
+                    } else if shift {
+                        // Shrink selection
+                        if let Some(ref mut e) = self.sel_cur {
+                            e.x -= dx; e.y -= dy;
+                        }
+                    } else {
+                        // Move selection
+                        if let Some(ref mut s) = self.sel_start { s.x += dx; s.y += dy; }
+                        if let Some(ref mut e) = self.sel_cur   { e.x += dx; e.y += dy; }
+                    }
+                    ctx.request_repaint();
+                }
+            }
+
+            // Smart window detection
+            if self.sel_start.is_none() {
+                #[cfg(target_os = "windows")]
+                { self.smart_rect = crate::win_capture::hovered_window_rect(self.cursor_px.0, self.cursor_px.1, &self.own_hwnds); }
             }
 
             // Smart click
@@ -384,14 +497,12 @@ impl AnnotateApp {
                 }
                 painter.rect_filled(overlay_rect, 0.0, Color32::from_black_alpha(80));
 
-                let scale = ctx.pixels_per_point();
-
                 // Smart highlight
                 if self.sel_start.is_none() {
                     if let Some(sr) = self.smart_rect {
                         let r = Rect::from_min_max(
-                            Pos2::new(sr[0] as f32 / scale, sr[1] as f32 / scale),
-                            Pos2::new(sr[2] as f32 / scale, sr[3] as f32 / scale),
+                            Pos2::new(sr[0] as f32/scale, sr[1] as f32/scale),
+                            Pos2::new(sr[2] as f32/scale, sr[3] as f32/scale),
                         );
                         if let Some(ref tex) = self.full_texture {
                             let uv = Rect::from_min_max(
@@ -416,7 +527,17 @@ impl AnnotateApp {
                     self.sel_cur   = self.sel_start;
                     self.smart_rect = None;
                 }
-                if resp.dragged() { self.sel_cur = resp.interact_pointer_pos(); ctx.request_repaint(); }
+                if resp.dragged() {
+                    self.sel_cur = resp.interact_pointer_pos();
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        self.cursor_px = ((p.x * scale) as i32, (p.y * scale) as i32);
+                    }
+                    ctx.request_repaint();
+                }
+                // Right-click cancels
+                if ui.input(|i| i.pointer.secondary_clicked()) && self.sel_start.is_some() {
+                    self.sel_start = None; self.sel_cur = None;
+                }
                 if resp.drag_stopped() {
                     self.sel_cur = resp.interact_pointer_pos();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -437,16 +558,26 @@ impl AnnotateApp {
                         painter.image(tex.id(), sr, uv, Color32::WHITE);
                     }
                     painter.rect_stroke(sr, 0.0, Stroke::new(2.0, Color32::WHITE), egui::StrokeKind::Outside);
-                    let pw = ((sr.width() * scale) as u32).max(0);
-                    let ph = ((sr.height() * scale) as u32).max(0);
+                    let pw = ((sr.width()*scale) as u32).max(0);
+                    let ph = ((sr.height()*scale) as u32).max(0);
                     painter.text(sr.max + Vec2::new(4.0,-14.0), egui::Align2::LEFT_TOP,
                         format!("{}×{}", pw, ph), egui::FontId::proportional(12.0), Color32::WHITE);
                 }
 
+                // Magnifier
+                let cursor_logical = Pos2::new(self.cursor_px.0 as f32/scale, self.cursor_px.1 as f32/scale);
+                if self.show_magnifier || self.sel_start.is_none() {
+                    draw_magnifier(&painter, &self.full_texture, self.full_w, self.full_h,
+                        cursor_logical, overlay_rect, scale,
+                        self.sample_color(self.cursor_px.0, self.cursor_px.1),
+                        self.color_fmt);
+                }
+
                 if self.sel_start.is_none() && self.smart_rect.is_none() {
-                    painter.text(overlay_rect.center(), egui::Align2::CENTER_CENTER,
-                        "拖拽手动框选  或  悬停到窗口上单击智能框选  •  Esc 取消",
-                        egui::FontId::proportional(16.0), Color32::WHITE);
+                    painter.text(overlay_rect.center() + Vec2::new(0.0, 40.0),
+                        egui::Align2::CENTER_CENTER,
+                        "拖拽框选  •  悬停单击智能框选  •  Alt放大镜  •  C取色  •  Esc取消",
+                        egui::FontId::proportional(14.0), Color32::WHITE);
                 }
                 ctx.request_repaint();
             });
@@ -470,12 +601,8 @@ impl AnnotateApp {
                     ui.checkbox(&mut self.hotkey.ctrl, "Ctrl");
                     ui.checkbox(&mut self.hotkey.shift, "Shift");
                     ui.checkbox(&mut self.hotkey.alt, "Alt");
-                    ui.add(egui::TextEdit::singleline(&mut self.hotkey.key).desired_width(36.0).hint_text("S"));
-                    if ui.button("✓ 保存").clicked() {
-                        self.hotkey.save_pub();
-                        self.hotkey_changed = true;
-                        self.editing_hotkey = false;
-                    }
+                    ui.add(egui::TextEdit::singleline(&mut self.hotkey.key).desired_width(40.0).hint_text("F1"));
+                    if ui.button("✓ 保存").clicked() { self.hotkey.save_pub(); self.hotkey_changed = true; self.editing_hotkey = false; }
                     if ui.button("✕").clicked() { self.editing_hotkey = false; }
                 } else {
                     ui.label(egui::RichText::new(self.hotkey.label()).color(Color32::from_rgb(56,189,248)).size(11.5));
@@ -494,6 +621,39 @@ impl AnnotateApp {
 
     pub fn editing_panel(&mut self, ctx: &egui::Context) {
         if self.capture_state != CaptureState::Editing { return; }
+
+        // ── Editing keyboard shortcuts ────────────────────────────────────────
+        // Enter / Ctrl+C = copy to clipboard
+        if ctx.input(|i| i.key_pressed(Key::Enter) ||
+            (i.modifiers.ctrl && i.key_pressed(Key::C)))
+        {
+            match self.copy_to_clipboard() {
+                Ok(_)  => { self.status = "已复制到剪贴板".to_string(); }
+                Err(e) => { self.status = format!("复制失败: {e}"); }
+            }
+        }
+        // Ctrl+S = save
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::S)) {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("PNG", &["png"]).set_file_name("screenshot.png").save_file()
+            {
+                match self.save_png(&path) {
+                    Ok(_)  => self.status = format!("已保存: {}", path.display()),
+                    Err(e) => self.status = format!("保存失败: {e}"),
+                }
+            }
+        }
+        // Esc = close
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.capture_state = CaptureState::Idle;
+            self.pixels = None; self.baked = None; self.texture = None;
+            self.annotations.clear(); self.undo_stack.clear(); self.status = String::new();
+            return;
+        }
+        // Ctrl+Z = undo
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Z)) { self.undo(); }
+
+        // Rebuild texture
         if self.texture_dirty {
             if let Some(ref rgba) = self.baked {
                 let ci = ColorImage::from_rgba_unmultiplied([self.img_w, self.img_h], rgba);
@@ -501,6 +661,7 @@ impl AnnotateApp {
             }
             self.texture_dirty = false;
         }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
                 let img_size = Vec2::new(self.img_w as f32, self.img_h as f32);
@@ -510,7 +671,20 @@ impl AnnotateApp {
                     painter.image(tex.id(), cr, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0,1.0)), Color32::WHITE);
                     let to_img    = |p: Pos2| Pos2::new((p.x-cr.min.x).clamp(0.0,img_size.x),(p.y-cr.min.y).clamp(0.0,img_size.y));
                     let to_screen = |p: Pos2| Pos2::new(cr.min.x+p.x, cr.min.y+p.y);
+
                     for ann in &self.annotations { draw_annotation_egui(&painter, ann, 1.0, &to_screen); }
+
+                    // Scroll wheel = adjust stroke width
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if resp.hovered() && scroll.abs() > 0.1 {
+                        self.stroke_w = (self.stroke_w + scroll * 0.3).clamp(1.0, 30.0);
+                    }
+
+                    // Right-click = cancel current pen stroke
+                    if resp.secondary_clicked() && self.tool == ShapeKind::Pen && !self.pen_points.is_empty() {
+                        self.pen_points.clear();
+                    }
+
                     if resp.drag_started() {
                         if let Some(pos) = resp.interact_pointer_pos() {
                             if self.tool == ShapeKind::Pen {
@@ -541,7 +715,7 @@ impl AnnotateApp {
                                 self.pen_points.clear();
                             } else if let Some(start) = self.drag_start.take() {
                                 let end = to_img(pos);
-                                if (end - start).length() > 2.0 {
+                                if (end-start).length() > 2.0 {
                                     self.undo_stack.push(self.annotations.clone());
                                     self.annotations.push(Annotation {
                                         kind: self.tool, color: self.color, width: self.stroke_w, filled: self.filled,
@@ -562,46 +736,70 @@ impl AnnotateApp {
                             width: self.stroke_w, filled: self.filled, p1: s, p2: e, pen_points: Vec::new() }, 1.0, &to_screen);
                     }
                 }
-                ui.add_space(6.0);
-                egui::Frame::new().fill(Color32::from_rgba_unmultiplied(20,22,30,230))
-                    .corner_radius(8.0).inner_margin(egui::Margin { left:8,right:8,top:6,bottom:6 })
+
+                // ── Floating toolbar below image ──────────────────────────────
+                ui.add_space(8.0);
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(18,20,28,240))
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin { left:10,right:10,top:7,bottom:7 })
                     .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        for (kind, label, tip) in [(ShapeKind::Rect,"▭","矩形"),(ShapeKind::Ellipse,"◯","椭圆"),
-                                                   (ShapeKind::Arrow,"→","箭头"),(ShapeKind::Pen,"✏","画笔")] {
+                        // Tools
+                        for (kind, label, tip) in [
+                            (ShapeKind::Rect,"▭","矩形 (R)"),
+                            (ShapeKind::Ellipse,"◯","椭圆 (E)"),
+                            (ShapeKind::Arrow,"→","箭头 (A)"),
+                            (ShapeKind::Pen,"✏","画笔 (P)"),
+                        ] {
                             let sel = self.tool == kind;
                             if ui.add(egui::Button::new(label)
                                 .fill(if sel {Color32::from_rgb(6,78,59)} else {Color32::from_rgb(38,42,54)})
-                                .min_size(egui::vec2(28.0,26.0))).on_hover_text(tip).clicked() { self.tool = kind; }
+                                .min_size(egui::vec2(30.0,28.0))).on_hover_text(tip).clicked() { self.tool = kind; }
                         }
+                        // Tool keyboard shortcuts
+                        ctx.input(|i| {
+                            if i.key_pressed(Key::R) { self.tool = ShapeKind::Rect; }
+                            if i.key_pressed(Key::E) { self.tool = ShapeKind::Ellipse; }
+                            if i.key_pressed(Key::A) { self.tool = ShapeKind::Arrow; }
+                            if i.key_pressed(Key::P) { self.tool = ShapeKind::Pen; }
+                        });
+
                         ui.add(egui::Separator::default().vertical().spacing(4.0));
                         ui.checkbox(&mut self.filled, "填充");
-                        ui.add(egui::Slider::new(&mut self.stroke_w, 1.0..=20.0).show_value(false));
+
+                        // Stroke width: 1/2 keys or slider
+                        if ctx.input(|i| i.key_pressed(Key::Num1)) { self.stroke_w = 2.0; }
+                        if ctx.input(|i| i.key_pressed(Key::Num2)) { self.stroke_w = 5.0; }
+                        ui.add(egui::Slider::new(&mut self.stroke_w, 1.0..=30.0).show_value(false));
                         ui.label(egui::RichText::new(format!("{:.0}px", self.stroke_w)).size(11.0));
+
                         ui.add(egui::Separator::default().vertical().spacing(4.0));
                         for &c in PALETTE {
                             let sel = self.color == c;
-                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(20.0,20.0), egui::Sense::click());
-                            ui.painter().rect_filled(rect, 3.0, c);
-                            if sel { ui.painter().rect_stroke(rect, 3.0, Stroke::new(2.0,Color32::WHITE), egui::StrokeKind::Outside); }
+                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0,22.0), egui::Sense::click());
+                            ui.painter().rect_filled(rect, 4.0, c);
+                            if sel { ui.painter().rect_stroke(rect, 4.0, Stroke::new(2.0,Color32::WHITE), egui::StrokeKind::Outside); }
                             if resp.clicked() { self.color = c; }
                         }
                         ui.color_edit_button_srgba(&mut self.color);
+
                         ui.add(egui::Separator::default().vertical().spacing(4.0));
                         let has = !self.annotations.is_empty();
-                        if ui.add_enabled(has, egui::Button::new("↩").min_size(egui::vec2(26.0,26.0))).on_hover_text("撤销").clicked() { self.undo(); }
-                        if ui.add_enabled(has, egui::Button::new("🗑").fill(Color32::from_rgb(100,20,20)).min_size(egui::vec2(26.0,26.0))).on_hover_text("清空").clicked() {
+                        if ui.add_enabled(has, egui::Button::new("↩").min_size(egui::vec2(28.0,28.0))).on_hover_text("撤销 Ctrl+Z").clicked() { self.undo(); }
+                        if ui.add_enabled(has, egui::Button::new("🗑").fill(Color32::from_rgb(100,20,20)).min_size(egui::vec2(28.0,28.0))).on_hover_text("清空标注").clicked() {
                             self.undo_stack.push(self.annotations.clone()); self.annotations.clear();
                             self.baked = self.pixels.clone(); self.texture_dirty = true;
                         }
+
                         ui.add(egui::Separator::default().vertical().spacing(4.0));
-                        if ui.add(egui::Button::new("📋 复制").min_size(egui::vec2(56.0,26.0))).on_hover_text("复制到剪贴板").clicked() {
+                        if ui.add(egui::Button::new("📋 复制").min_size(egui::vec2(60.0,28.0))).on_hover_text("复制到剪贴板 Enter").clicked() {
                             match self.copy_to_clipboard() {
                                 Ok(_) => self.status = "已复制到剪贴板".to_string(),
                                 Err(e) => self.status = format!("复制失败: {e}"),
                             }
                         }
-                        if ui.add(egui::Button::new("💾 保存").min_size(egui::vec2(56.0,26.0))).clicked() {
+                        if ui.add(egui::Button::new("💾 保存").min_size(egui::vec2(60.0,28.0))).on_hover_text("保存 Ctrl+S").clicked() {
                             if let Some(path) = rfd::FileDialog::new().add_filter("PNG",&["png"]).set_file_name("screenshot.png").save_file() {
                                 match self.save_png(&path) {
                                     Ok(_) => self.status = format!("已保存: {}", path.display()),
@@ -609,7 +807,7 @@ impl AnnotateApp {
                                 }
                             }
                         }
-                        if ui.add(egui::Button::new("✕ 关闭").min_size(egui::vec2(56.0,26.0))).clicked() {
+                        if ui.add(egui::Button::new("✕").min_size(egui::vec2(28.0,28.0))).on_hover_text("关闭 Esc").clicked() {
                             self.capture_state = CaptureState::Idle;
                             self.pixels = None; self.baked = None; self.texture = None;
                             self.annotations.clear(); self.undo_stack.clear(); self.status = String::new();
@@ -620,6 +818,66 @@ impl AnnotateApp {
         });
     }
 } // end impl AnnotateApp
+
+// ── Magnifier ─────────────────────────────────────────────────────────────────
+
+fn draw_magnifier(
+    painter: &egui::Painter,
+    full_tex: &Option<TextureHandle>,
+    full_w: usize, full_h: usize,
+    cursor: Pos2,
+    overlay_rect: Rect,
+    scale: f32,
+    pixel_color: Option<Color32>,
+    color_fmt: ColorFmt,
+) {
+    let mag_size = 160.0f32;
+    let zoom = 8.0f32;
+    let sample_r = (mag_size / zoom / 2.0) as i32; // physical pixels to sample
+
+    // Position magnifier: prefer bottom-right of cursor, flip if near edge
+    let mut mx = cursor.x + 20.0;
+    let mut my = cursor.y + 20.0;
+    if mx + mag_size > overlay_rect.max.x - 10.0 { mx = cursor.x - mag_size - 20.0; }
+    if my + mag_size + 24.0 > overlay_rect.max.y - 10.0 { my = cursor.y - mag_size - 44.0; }
+    let mag_rect = Rect::from_min_size(Pos2::new(mx, my), Vec2::splat(mag_size));
+
+    // Draw magnified region from full-screen texture
+    if let Some(ref tex) = full_tex {
+        let cx_px = (cursor.x * scale) as f32;
+        let cy_px = (cursor.y * scale) as f32;
+        let fw = full_w as f32; let fh = full_h as f32;
+        let uv_min = Pos2::new(
+            ((cx_px - sample_r as f32) / fw).clamp(0.0, 1.0),
+            ((cy_px - sample_r as f32) / fh).clamp(0.0, 1.0),
+        );
+        let uv_max = Pos2::new(
+            ((cx_px + sample_r as f32) / fw).clamp(0.0, 1.0),
+            ((cy_px + sample_r as f32) / fh).clamp(0.0, 1.0),
+        );
+        painter.rect_filled(mag_rect, 4.0, Color32::BLACK);
+        painter.image(tex.id(), mag_rect, Rect::from_min_max(uv_min, uv_max), Color32::WHITE);
+        // Crosshair
+        let center = mag_rect.center();
+        painter.line_segment([Pos2::new(center.x, mag_rect.min.y), Pos2::new(center.x, mag_rect.max.y)],
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255,255,255,120)));
+        painter.line_segment([Pos2::new(mag_rect.min.x, center.y), Pos2::new(mag_rect.max.x, center.y)],
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255,255,255,120)));
+        // Border
+        painter.rect_stroke(mag_rect, 4.0, Stroke::new(2.0, Color32::from_rgb(56,189,248)), egui::StrokeKind::Outside);
+    }
+
+    // Color swatch + value below magnifier
+    if let Some(c) = pixel_color {
+        let swatch_rect = Rect::from_min_size(
+            Pos2::new(mx, my + mag_size + 2.0), Vec2::new(mag_size, 20.0)
+        );
+        painter.rect_filled(swatch_rect, 3.0, c);
+        let text_color = if c.r() as u32 + c.g() as u32 + c.b() as u32 > 382 { Color32::BLACK } else { Color32::WHITE };
+        painter.text(swatch_rect.center(), egui::Align2::CENTER_CENTER,
+            color_fmt.format(c), egui::FontId::monospace(11.0), text_color);
+    }
+}
 
 // ── egui painter helpers ──────────────────────────────────────────────────────
 
@@ -717,17 +975,8 @@ fn draw_arrow(buf:&mut[u8],w:usize,h:usize,p1:Pos2,p2:Pos2,c:Color32,lw:i32) {
     let len=(dx*dx+dy*dy).sqrt().max(1.0);
     let (ux,uy)=(dx/len,dy/len);
     let (head,angle)=(18.0_f32,0.4_f32);
-    // Correct arrowhead: rotate unit vector ±angle around tip
-    // Wing 1: rotate +angle (clockwise in screen coords)
-    let ax1=Pos2::new(
-        p2.x - head*(ux*angle.cos() - uy*angle.sin()),
-        p2.y - head*(ux*angle.sin() + uy*angle.cos()),
-    );
-    // Wing 2: rotate -angle (counter-clockwise)
-    let ax2=Pos2::new(
-        p2.x - head*(ux*angle.cos() + uy*angle.sin()),
-        p2.y - head*(-ux*angle.sin() + uy*angle.cos()),
-    );
+    let ax1=Pos2::new(p2.x-head*(ux*angle.cos()-uy*angle.sin()), p2.y-head*(ux*angle.sin()+uy*angle.cos()));
+    let ax2=Pos2::new(p2.x-head*(ux*angle.cos()+uy*angle.sin()), p2.y-head*(-ux*angle.sin()+uy*angle.cos()));
     draw_line_thick(buf,w,h,p2,ax1,c,lw);
     draw_line_thick(buf,w,h,p2,ax2,c,lw);
 }
