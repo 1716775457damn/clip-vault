@@ -921,7 +921,8 @@ impl eframe::App for App {
             }
         }
 
-        // Close button → minimize
+        // Close button → minimize to tray (double-click tray or use menu to restore)
+        // Alt+F4 or tray Quit to actually exit
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.clip.query.clear();
@@ -937,10 +938,13 @@ impl eframe::App for App {
             self.clip.just_shown = true;
         }
 
-        // Screenshot hotkey → trigger capture directly, no focus needed
+        // Screenshot hotkey → minimize first, then capture (so window doesn't appear in screenshot)
         if self.screenshot_triggered.swap(false, Ordering::Relaxed) {
-            self.annotate.trigger_capture();
             self.tab = Tab::Annotate;
+            // Minimize window before capture so it's not in the screenshot
+            self.annotate.start_capture_after_minimize();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            ctx.request_repaint();
         }
 
         // Win+drag super-capture completed → switch to Annotate tab
@@ -1025,8 +1029,17 @@ impl eframe::App for App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                     ctx.request_repaint();
                 }
+                // Poll for hotkey-triggered capture (window already minimized)
+                if self.annotate.poll_capture_hotkey() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    ctx.request_repaint();
+                }
                 self.annotate.editing_panel(ctx);
             }
         }
+        // Render pinned floating windows (always, regardless of active tab)
+        self.annotate.render_pinned(ctx);
     }
 }

@@ -1,6 +1,25 @@
 use eframe::egui;
 use egui::{Color32, ColorImage, Key, Pos2, Rect, Stroke, TextureHandle, Vec2};
 
+// ── Pinned image (贴图) ───────────────────────────────────────────────────────
+
+pub struct PinnedImage {
+    pixels: Vec<u8>, w: usize, h: usize,
+    texture: Option<TextureHandle>,
+    open: bool,
+    zoom: f32,
+    id: egui::ViewportId,
+}
+
+impl PinnedImage {
+    fn new(pixels: Vec<u8>, w: usize, h: usize) -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
+        Self { pixels, w, h, texture: None, open: true, zoom: 1.0,
+            id: egui::ViewportId::from_hash_of(ts) }
+    }
+}
+
 // ── Shape types ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -332,6 +351,8 @@ pub struct AnnotateApp {
     pixels: Option<Vec<u8>>, img_w: usize, img_h: usize,
     baked: Option<Vec<u8>>,
     texture: Option<TextureHandle>, texture_dirty: bool,
+    /// Zoom level for editing view (Ctrl+scroll)
+    zoom: f32,
 
     annotations: Vec<Annotation>,
     undo_stack:  Vec<Vec<Annotation>>,
@@ -371,8 +392,11 @@ pub struct AnnotateApp {
     smart_last_rect: Option<[i32; 4]>,
 
     capture_rx: Option<std::sync::mpsc::Receiver<CaptureResult>>,
+    capture_hotkey_rx: Option<std::sync::mpsc::Receiver<CaptureResult>>,
     pub capture_btn_clicked: bool,
     status: String,
+    /// Pinned images: (pixels, w, h, viewport_id, open)
+    pinned: Vec<PinnedImage>,
 
     // Win+drag super-capture state (Windows only)
     #[cfg(target_os = "windows")]
@@ -416,8 +440,10 @@ impl Default for AnnotateApp {
             #[cfg(target_os = "windows")] mouse_hook: None,
             #[cfg(target_os = "windows")] smart_last_pos: (i32::MIN, i32::MIN),
             #[cfg(target_os = "windows")] smart_last_rect: None,
-            capture_rx: None, capture_btn_clicked: false,
+            capture_rx: None, capture_hotkey_rx: None, capture_btn_clicked: false,
             status: String::new(),
+            zoom: 1.0,
+            pinned: Vec::new(),
             #[cfg(target_os = "windows")] super_hook_mouse: None,
             #[cfg(target_os = "windows")] super_hook_kb: None,
             super_drag_start: None, super_drag_cur: None,
@@ -454,6 +480,51 @@ impl AnnotateApp {
                 }
             }
         });
+    }
+
+    /// Called when hotkey triggers capture — window is already being minimized.
+    /// Uses a longer delay to ensure window is fully hidden before capture.
+    pub fn start_capture_after_minimize(&mut self) {
+        #[cfg(target_os = "windows")]
+        { self.own_hwnds = crate::win_capture::get_process_hwnds(); }
+        let (tx, rx) = std::sync::mpsc::channel::<CaptureResult>();
+        self.capture_hotkey_rx = Some(rx);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            #[cfg(target_os = "windows")]
+            if let Some((pixels, w, h)) = crate::win_capture::capture_fullscreen() {
+                let _ = tx.send(CaptureResult { pixels, width: w, height: h }); return;
+            }
+            if let Ok(screens) = screenshots::Screen::all() {
+                if let Some(screen) = screens.into_iter().next() {
+                    if let Ok(img) = screen.capture() {
+                        let w = img.width() as usize; let h = img.height() as usize;
+                        let _ = tx.send(CaptureResult { pixels: img.into_raw(), width: w, height: h });
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn poll_capture_hotkey(&mut self) -> bool {
+        let rx = match self.capture_hotkey_rx.as_ref() { Some(r)=>r, None=>return false };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.full_w = result.width; self.full_h = result.height;
+                self.full_pixels = Some(result.pixels);
+                self.full_texture = None;
+                self.sel_start = None; self.sel_cur = None; self.smart_rect = None;
+                self.show_magnifier = false; self.picked_color = None;
+                self.capture_state = CaptureState::Selecting;
+                self.capture_hotkey_rx = None;
+                self.status = "拖拽框选  •  悬停单击智能框选  •  Alt放大镜  •  C取色  •  Esc取消".to_string();
+                #[cfg(target_os = "windows")]
+                { self.mouse_hook = crate::win_capture::LowLevelMouseHook::install(); }
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(_) => { self.capture_hotkey_rx = None; false }
+        }
     }
 
     pub fn poll_capture(&mut self) -> bool {
@@ -827,6 +898,8 @@ impl AnnotateApp {
             return;
         }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Z)) { self.undo(); }
+        // Ctrl+0 reset zoom
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Num0)) { self.zoom = 1.0; }
         // Tool shortcuts
         ctx.input(|i| {
             if i.key_pressed(Key::R) { self.set_tool(ShapeKind::Rect); }
@@ -847,27 +920,26 @@ impl AnnotateApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Ctrl+scroll anywhere in panel = zoom
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if ui.input(|i| i.modifiers.ctrl) && scroll.abs() > 0.1 {
+                self.zoom = (self.zoom * (1.0 + scroll * 0.002)).clamp(0.1, 8.0);
+            }
             egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                let img_size = Vec2::new(self.img_w as f32, self.img_h as f32);
+                let img_size = Vec2::new(self.img_w as f32 * self.zoom, self.img_h as f32 * self.zoom);
                 if let Some(ref tex) = self.texture {
                     let (cr, resp) = ui.allocate_exact_size(img_size, egui::Sense::drag());
                     let painter = ui.painter_at(cr);
                     painter.image(tex.id(), cr, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0,1.0)), Color32::WHITE);
-                    let to_img    = |p: Pos2| Pos2::new((p.x-cr.min.x).clamp(0.0,img_size.x),(p.y-cr.min.y).clamp(0.0,img_size.y));
-                    let to_screen = |p: Pos2| Pos2::new(cr.min.x+p.x, cr.min.y+p.y);
-                    for ann in &self.annotations { draw_annotation_egui(&painter, ann, 1.0, &to_screen); }
+                    // Convert between screen and image coords (accounting for zoom)
+                    let zoom = self.zoom;
+                    let to_img    = |p: Pos2| Pos2::new((p.x-cr.min.x).clamp(0.0,img_size.x)/zoom,(p.y-cr.min.y).clamp(0.0,img_size.y)/zoom);
+                    let to_screen = |p: Pos2| Pos2::new(cr.min.x+p.x*zoom, cr.min.y+p.y*zoom);
+                    for ann in &self.annotations { draw_annotation_egui(&painter, ann, zoom, &to_screen); }
 
-                    // Scroll wheel: Ctrl = opacity, else = stroke width
-                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                    if resp.hovered() && scroll.abs()>0.1 {
-                        if ui.input(|i| i.modifiers.ctrl) {
-                            let a = self.color.a();
-                            let new_a = (a as f32 + scroll*5.0).clamp(20.0,255.0) as u8;
-                            self.color = Color32::from_rgba_unmultiplied(self.color.r(),self.color.g(),self.color.b(),new_a);
-                            self.save_tool_color();
-                        } else {
-                            self.stroke_w = (self.stroke_w + scroll*0.3).clamp(1.0,30.0);
-                        }
+                    // Scroll wheel without Ctrl = stroke width
+                    if resp.hovered() && scroll.abs()>0.1 && !ui.input(|i| i.modifiers.ctrl) {
+                        self.stroke_w = (self.stroke_w + scroll*0.3).clamp(1.0,30.0);
                     }
 
                     // Right-click: cancel pen stroke
@@ -961,6 +1033,11 @@ impl AnnotateApp {
 
                 // ── Floating toolbar ──────────────────────────────────────────
                 ui.add_space(8.0);
+                // Zoom indicator
+                if (self.zoom - 1.0).abs() > 0.01 {
+                    ui.label(egui::RichText::new(format!("缩放: {:.0}%  (Ctrl+滚轮调整，Ctrl+0 重置)", self.zoom*100.0))
+                        .color(Color32::from_rgb(148,163,184)).size(11.0));
+                }
                 egui::Frame::new()
                     .fill(Color32::from_rgba_unmultiplied(18,20,28,245))
                     .corner_radius(10.0)
@@ -1074,6 +1151,12 @@ impl AnnotateApp {
                                 }
                             }
                         }
+                        // Pin to screen
+                        if ui.add(egui::Button::new("📌 贴图").fill(Color32::from_rgb(80,50,10)).min_size(egui::vec2(60.0,28.0))).on_hover_text("将截图贴在屏幕上（置顶悬浮）").clicked() {
+                            if let Some(ref baked) = self.baked {
+                                self.pinned.push(PinnedImage::new(baked.clone(), self.img_w, self.img_h));
+                            }
+                        }
                         if ui.add(egui::Button::new("✕").min_size(egui::vec2(28.0,28.0))).on_hover_text("关闭 Esc").clicked() {
                             self.capture_state=CaptureState::Idle;
                             self.pixels=None; self.baked=None; self.texture=None;
@@ -1084,6 +1167,47 @@ impl AnnotateApp {
             });
         });
     }
+    /// Render all pinned floating windows. Call from App::update every frame.
+    pub fn render_pinned(&mut self, ctx: &egui::Context) {
+        self.pinned.retain(|p| p.open);
+        for pin in &mut self.pinned {
+            if pin.texture.is_none() {
+                let ci = ColorImage::from_rgba_unmultiplied([pin.w, pin.h], &pin.pixels);
+                pin.texture = Some(ctx.load_texture(
+                    format!("pin_{:?}", pin.id), ci, egui::TextureOptions::LINEAR));
+            }
+            let tex_id = pin.texture.as_ref().map(|t| t.id());
+            let w = pin.w; let h = pin.h;
+            let open = &mut pin.open;
+            let zoom = &mut pin.zoom;
+            ctx.show_viewport_immediate(
+                pin.id,
+                egui::ViewportBuilder::default()
+                    .with_title(format!("贴图 {}×{}", w, h))
+                    .with_inner_size([w as f32 * *zoom, h as f32 * *zoom])
+                    .with_always_on_top()
+                    .with_resizable(true),
+                move |ctx, _| {
+                    if ctx.input(|i| i.viewport().close_requested()) { *open = false; }
+                    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) { *open = false; }
+                    let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+                    if ctx.input(|i| i.modifiers.ctrl) && scroll.abs() > 0.1 {
+                        *zoom = (*zoom * (1.0 + scroll * 0.002)).clamp(0.1, 8.0);
+                    }
+                    if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Num0)) { *zoom = 1.0; }
+                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                        if let Some(tid) = tex_id {
+                            let avail = ui.available_size();
+                            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                                tid, egui::vec2(w as f32, h as f32)))
+                                .fit_to_exact_size(avail));
+                        }
+                    });
+                },
+            );
+        }
+    }
+
     /// Install always-on hooks for Win+drag detection.
     /// Called once at startup from App.
     pub fn install_super_hooks(&mut self) {
