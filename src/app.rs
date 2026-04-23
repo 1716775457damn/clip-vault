@@ -882,7 +882,7 @@ impl App {
         screenshot_id_atomic: Arc<AtomicU32>,
         tray_rx: std::sync::mpsc::Receiver<TrayMsg>,
     ) -> Self {
-        Self {
+        let mut app = Self {
             tab: Tab::Clip,
             clip: ClipApp::new(rx),
             search: SearchApp::default(),
@@ -895,7 +895,10 @@ impl App {
             screenshot_id_atomic,
             hotkey_manager,
             tray_rx,
-        }
+        };
+        // Install always-on Win+drag hooks
+        app.annotate.install_super_hooks();
+        app
     }
 }
 
@@ -938,6 +941,15 @@ impl eframe::App for App {
         if self.screenshot_triggered.swap(false, Ordering::Relaxed) {
             self.annotate.trigger_capture();
             self.tab = Tab::Annotate;
+        }
+
+        // Win+drag super-capture completed → switch to Annotate tab
+        if self.annotate.tab_switch_needed {
+            self.annotate.tab_switch_needed = false;
+            self.tab = Tab::Annotate;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.request_repaint();
         }
 
         // Re-register screenshot hotkey if config changed

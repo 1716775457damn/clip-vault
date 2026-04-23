@@ -302,7 +302,7 @@ impl ColorFmt {
 // ── Capture history ───────────────────────────────────────────────────────────
 
 const MAX_HISTORY: usize = 10;
-struct HistoryEntry { pixels: Vec<u8>, w: usize, h: usize }
+pub struct HistoryEntry { pub pixels: Vec<u8>, pub w: usize, pub h: usize }
 
 // ── State machine ─────────────────────────────────────────────────────────────
 
@@ -362,6 +362,22 @@ pub struct AnnotateApp {
     capture_rx: Option<std::sync::mpsc::Receiver<CaptureResult>>,
     pub capture_btn_clicked: bool,
     status: String,
+
+    // Win+drag super-capture state (Windows only)
+    #[cfg(target_os = "windows")]
+    super_hook_mouse: Option<crate::win_capture::LowLevelMouseHook>,
+    #[cfg(target_os = "windows")]
+    super_hook_kb: Option<crate::win_capture::LowLevelKeyboardHook>,
+    /// Win+drag selection in progress
+    super_drag_start: Option<(i32, i32)>,
+    super_drag_cur:   Option<(i32, i32)>,
+    /// Overlay texture for Win+drag (full screen)
+    super_texture: Option<TextureHandle>,
+    super_pixels:  Option<Vec<u8>>,
+    super_w: usize, super_h: usize,
+    super_active: bool,
+    /// Set when super-capture completes, so App can switch to Annotate tab
+    pub tab_switch_needed: bool,
 }
 
 impl Default for AnnotateApp {
@@ -389,6 +405,12 @@ impl Default for AnnotateApp {
             #[cfg(target_os = "windows")] mouse_hook: None,
             capture_rx: None, capture_btn_clicked: false,
             status: String::new(),
+            #[cfg(target_os = "windows")] super_hook_mouse: None,
+            #[cfg(target_os = "windows")] super_hook_kb: None,
+            super_drag_start: None, super_drag_cur: None,
+            super_texture: None, super_pixels: None,
+            super_w: 0, super_h: 0, super_active: false,
+            tab_switch_needed: false,
         }
     }
 }
@@ -559,6 +581,17 @@ impl AnnotateApp {
     }
 
     pub fn update(&mut self, ctx: &egui::Context) -> bool {
+        // ── Win+drag super-capture (Windows only) ───────────────────────────────
+        #[cfg(target_os = "windows")]
+        self.update_super_capture(ctx);
+
+        // If super-capture is active, render its overlay and skip normal flow
+        #[cfg(target_os = "windows")]
+        if self.super_active {
+            self.render_super_overlay(ctx);
+            return false;
+        }
+
         if self.capture_state == CaptureState::Idle && !self.editing_hotkey {
             if self.hotkey.matches(ctx) { return true; }
         }
@@ -637,7 +670,7 @@ impl AnnotateApp {
             }
             if hook_clicked && self.sel_start.is_none() && self.smart_rect.is_some() {
                 #[cfg(target_os = "windows")]
-                crate::win_capture::LowLevelMouseHook::consume_click();
+                if let Some(ref hook) = self.mouse_hook { hook.consume_click(); }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                 self.commit_selection(ctx); return false;
             }
@@ -1034,6 +1067,174 @@ impl AnnotateApp {
             });
         });
     }
+    /// Install always-on hooks for Win+drag detection.
+    /// Called once at startup from App.
+    pub fn install_super_hooks(&mut self) {
+        #[cfg(target_os = "windows")] {
+            self.super_hook_mouse = crate::win_capture::LowLevelMouseHook::install();
+            self.super_hook_kb    = crate::win_capture::LowLevelKeyboardHook::install();
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn update_super_capture(&mut self, ctx: &egui::Context) {
+        let kb = crate::win_capture::LowLevelKeyboardHook::poll();
+        let ms = crate::win_capture::LowLevelMouseHook::poll();
+
+        // Only act when not already in a capture flow
+        if self.capture_state != CaptureState::Idle { return; }
+
+        if kb.win_held {
+            if ms.clicked && self.super_drag_start.is_none() {
+                // Win key held + LButton down: start drag
+                // Grab full screen immediately (no window hide needed)
+                if let Some((pixels, w, h)) = crate::win_capture::capture_fullscreen() {
+                    self.super_pixels = Some(pixels);
+                    self.super_w = w; self.super_h = h;
+                    self.super_texture = None;
+                    self.super_drag_start = Some(ms.pos);
+                    self.super_drag_cur   = Some(ms.pos);
+                    self.super_active = true;
+                    // Consume the click so it doesn't trigger other things
+                    if let Some(ref hook) = self.super_hook_mouse { hook.consume_click(); }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    ctx.request_repaint();
+                }
+            } else if self.super_active {
+                // Update drag position
+                self.super_drag_cur = Some(ms.pos);
+                ctx.request_repaint();
+
+                if ms.released {
+                    // Drag ended: commit selection
+                    if let Some(ref hook) = self.super_hook_mouse { hook.consume_release(); }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    self.commit_super_selection();
+                }
+            }
+        } else if self.super_active {
+            // Win key released mid-drag: cancel
+            self.cancel_super_capture(ctx);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn commit_super_selection(&mut self) {
+        let (sx, sy) = match self.super_drag_start { Some(p)=>p, None=>{ self.cancel_super_capture_silent(); return; } };
+        let (ex, ey) = match self.super_drag_cur   { Some(p)=>p, None=>{ self.cancel_super_capture_silent(); return; } };
+        let x0 = sx.min(ex); let y0 = sy.min(ey);
+        let x1 = sx.max(ex); let y1 = sy.max(ey);
+        let cw = (x1-x0).max(0) as usize; let ch = (y1-y0).max(0) as usize;
+
+        self.super_active = false;
+        self.super_drag_start = None; self.super_drag_cur = None;
+        self.super_texture = None; self.super_pixels = None;
+
+        if cw < 4 || ch < 4 { return; }
+
+        // Use GDI for a fresh capture of the exact rect
+        if let Some(cropped) = crate::win_capture::capture_rect_gdi(x0, y0, cw as i32, ch as i32) {
+            if !cropped.is_empty() {
+                self.history.push(crate::annotate_app::HistoryEntry { pixels: cropped.clone(), w: cw, h: ch });
+                if self.history.len() > MAX_HISTORY { self.history.remove(0); }
+                self.img_w = cw; self.img_h = ch;
+                self.pixels = Some(cropped.clone()); self.baked = Some(cropped);
+                self.annotations.clear(); self.undo_stack.clear();
+                self.next_number = 1;
+                self.texture = None; self.texture_dirty = true;
+                self.capture_state = CaptureState::Editing;
+                self.status = format!("{}×{} — Win+拖拽截图完成", cw, ch);
+                self.tab_switch_needed = true;
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn cancel_super_capture(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        self.cancel_super_capture_silent();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn cancel_super_capture_silent(&mut self) {
+        self.super_active = false;
+        self.super_drag_start = None; self.super_drag_cur = None;
+        self.super_texture = None; self.super_pixels = None;
+    }
+
+    #[cfg(target_os = "windows")]
+    fn render_super_overlay(&mut self, ctx: &egui::Context) {
+        // Upload full-screen texture once
+        if self.super_texture.is_none() {
+            if let Some(ref px) = self.super_pixels {
+                use egui::ColorImage;
+                let ci = ColorImage::from_rgba_unmultiplied([self.super_w, self.super_h], px);
+                self.super_texture = Some(ctx.load_texture("super_fs", ci, egui::TextureOptions::NEAREST));
+            }
+        }
+
+        // Esc cancels
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.cancel_super_capture(ctx);
+            return;
+        }
+
+        let scale = ctx.pixels_per_point();
+
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+            let avail = ui.available_size();
+            let (overlay_rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
+            let painter = ui.painter_at(overlay_rect);
+
+            // Draw full-screen screenshot
+            if let Some(ref tex) = self.super_texture {
+                painter.image(tex.id(), overlay_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0,1.0)),
+                    egui::Color32::WHITE);
+            }
+            // Dim
+            painter.rect_filled(overlay_rect, 0.0, egui::Color32::from_black_alpha(60));
+
+            // Draw selection rect
+            if let (Some(s), Some(e)) = (self.super_drag_start, self.super_drag_cur) {
+                let sl = egui::Pos2::new(s.0 as f32/scale, s.1 as f32/scale);
+                let el = egui::Pos2::new(e.0 as f32/scale, e.1 as f32/scale);
+                let sr = egui::Rect::from_two_pos(sl, el);
+
+                // Un-dim selected area
+                if let Some(ref tex) = self.super_texture {
+                    let uv = egui::Rect::from_min_max(
+                        egui::Pos2::new((sr.min.x-overlay_rect.min.x)/overlay_rect.width(),
+                                        (sr.min.y-overlay_rect.min.y)/overlay_rect.height()),
+                        egui::Pos2::new((sr.max.x-overlay_rect.min.x)/overlay_rect.width(),
+                                        (sr.max.y-overlay_rect.min.y)/overlay_rect.height()),
+                    );
+                    painter.image(tex.id(), sr, uv, egui::Color32::WHITE);
+                }
+
+                // Border
+                painter.rect_stroke(sr, 0.0,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(56,189,248)),
+                    egui::StrokeKind::Outside);
+
+                // Size label
+                let pw = ((sr.width()*scale) as u32).max(0);
+                let ph = ((sr.height()*scale) as u32).max(0);
+                painter.text(sr.max + egui::Vec2::new(4.0,-14.0),
+                    egui::Align2::LEFT_TOP, format!("{}×{}", pw, ph),
+                    egui::FontId::proportional(12.0), egui::Color32::WHITE);
+            }
+
+            // Hint
+            if self.super_drag_start.is_none() {
+                painter.text(overlay_rect.center(), egui::Align2::CENTER_CENTER,
+                    "Win + 拖拽选择截图区域  •  Esc 取消",
+                    egui::FontId::proportional(18.0), egui::Color32::WHITE);
+            }
+            ctx.request_repaint();
+        });
+    }
+
 } // end impl AnnotateApp
 
 // ── Magnifier ─────────────────────────────────────────────────────────────────

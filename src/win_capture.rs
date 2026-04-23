@@ -163,12 +163,71 @@ pub fn capture_fullscreen() -> Option<(Vec<u8>, usize, usize)> {
     Some((pixels, w as usize, h as usize))
 }
 
+// ── Low-level keyboard hook (Win key detection) ─────────────────────────────
+
+#[derive(Default, Clone)]
+pub struct KeyboardState {
+    /// True while either Win key is held down
+    pub win_held: bool,
+}
+
+static KB_STATE: Mutex<Option<KeyboardState>> = Mutex::new(None);
+
+pub struct LowLevelKeyboardHook {
+    hhook: HHOOK,
+}
+
+impl LowLevelKeyboardHook {
+    pub fn install() -> Option<Self> {
+        use windows::Win32::UI::WindowsAndMessaging::WH_KEYBOARD_LL;
+        unsafe {
+            *KB_STATE.lock().unwrap() = Some(KeyboardState::default());
+            let h = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_kb_proc), None, 0).ok()?;
+            Some(Self { hhook: h })
+        }
+    }
+
+    pub fn poll() -> KeyboardState {
+        KB_STATE.lock().unwrap().clone().unwrap_or_default()
+    }
+}
+
+impl Drop for LowLevelKeyboardHook {
+    fn drop(&mut self) {
+        unsafe { let _ = UnhookWindowsHookEx(self.hhook); }
+        *KB_STATE.lock().unwrap() = None;
+    }
+}
+
+unsafe extern "system" fn ll_kb_proc(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP};
+    const VK_LWIN: u32 = 0x5B;
+    const VK_RWIN: u32 = 0x5C;
+    if code >= 0 {
+        let ks = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let vk = ks.vkCode;
+        if vk == VK_LWIN || vk == VK_RWIN {
+            let down = wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN;
+            if let Ok(mut g) = KB_STATE.lock() {
+                if let Some(ref mut state) = *g { state.win_held = down; }
+            }
+        }
+    }
+    CallNextHookEx(HHOOK(std::ptr::null_mut()), code, wparam, lparam)
+}
+
 // ── Low-level mouse hook ──────────────────────────────────────────────────────
 
 #[derive(Default, Clone)]
 pub struct MouseState {
-    pub pos:     (i32, i32),
-    pub clicked: bool,
+    pub pos:        (i32, i32),
+    pub clicked:    bool,   // LButtonDown edge
+    pub released:   bool,   // LButtonUp edge
+    pub btn_down:   bool,   // LButton currently held
 }
 
 static HOOK_STATE: Mutex<Option<MouseState>> = Mutex::new(None);
@@ -192,9 +251,14 @@ impl LowLevelMouseHook {
         HOOK_STATE.lock().unwrap().clone().unwrap_or_default()
     }
 
-    pub fn consume_click() {
+    pub fn consume_click(&self) {
         if let Ok(mut g) = HOOK_STATE.lock() {
             if let Some(ref mut s) = *g { s.clicked = false; }
+        }
+    }
+    pub fn consume_release(&self) {
+        if let Ok(mut g) = HOOK_STATE.lock() {
+            if let Some(ref mut s) = *g { s.released = false; }
         }
     }
 }
@@ -211,12 +275,16 @@ unsafe extern "system" fn ll_mouse_proc(
     wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{WM_LBUTTONUP, WM_MOUSEMOVE};
     if code >= 0 {
         let ms = &*(lparam.0 as *const MSLLHOOKSTRUCT);
         if let Ok(mut g) = HOOK_STATE.lock() {
             if let Some(ref mut state) = *g {
                 state.pos = (ms.pt.x, ms.pt.y);
-                if wparam.0 as u32 == WM_LBUTTONDOWN { state.clicked = true; }
+                let msg = wparam.0 as u32;
+                if msg == WM_LBUTTONDOWN  { state.clicked = true;  state.btn_down = true; }
+                if msg == WM_LBUTTONUP    { state.released = true; state.btn_down = false; }
+                if msg == WM_MOUSEMOVE    { /* pos already updated */ }
             }
         }
     }
