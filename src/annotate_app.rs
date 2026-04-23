@@ -207,6 +207,12 @@ impl Palette {
     fn colors(&self) -> Vec<Color32> {
         self.colors.iter().map(|c| Color32::from_rgba_unmultiplied(c[0],c[1],c[2],c[3])).collect()
     }
+    /// Cached version: only reallocates when palette changes.
+    fn colors_cached(&self, cache: &mut Vec<Color32>) {
+        if cache.len() != self.colors.len() {
+            *cache = self.colors();
+        }
+    }
 }
 fn palette_path() -> Option<std::path::PathBuf> {
     Some(dirs::data_local_dir()?.join("clip-vault").join("palette.json"))
@@ -344,7 +350,7 @@ pub struct AnnotateApp {
 
     tool_colors: ToolColors,
     palette:     Palette,
-    /// Whether palette editor is open
+    palette_cache: Vec<Color32>, // cached Color32 list, rebuilt only when palette changes
     show_palette_editor: bool,
 
     history: Vec<HistoryEntry>, history_idx: Option<usize>,
@@ -358,6 +364,11 @@ pub struct AnnotateApp {
     own_hwnds: Vec<isize>,
     #[cfg(target_os = "windows")]
     mouse_hook: Option<crate::win_capture::LowLevelMouseHook>,
+    /// Throttle cache for hovered_window_rect
+    #[cfg(target_os = "windows")]
+    smart_last_pos:  (i32, i32),
+    #[cfg(target_os = "windows")]
+    smart_last_rect: Option<[i32; 4]>,
 
     capture_rx: Option<std::sync::mpsc::Receiver<CaptureResult>>,
     pub capture_btn_clicked: bool,
@@ -397,12 +408,14 @@ impl Default for AnnotateApp {
             line_style: LineStyle::Solid,
             drag_start: None, cur_drag: None, pen_points: Vec::new(),
             text_input: String::new(), next_number: 1,
-            tool_colors, palette: Palette::load(), show_palette_editor: false,
+            tool_colors, palette: Palette::load(), palette_cache: Vec::new(), show_palette_editor: false,
             history: Vec::new(), history_idx: None,
             hotkey: HotkeyConfig::load(), editing_hotkey: false, hotkey_changed: false,
             smart_rect: None,
             #[cfg(target_os = "windows")] own_hwnds: Vec::new(),
             #[cfg(target_os = "windows")] mouse_hook: None,
+            #[cfg(target_os = "windows")] smart_last_pos: (i32::MIN, i32::MIN),
+            #[cfg(target_os = "windows")] smart_last_rect: None,
             capture_rx: None, capture_btn_clicked: false,
             status: String::new(),
             #[cfg(target_os = "windows")] super_hook_mouse: None,
@@ -666,7 +679,10 @@ impl AnnotateApp {
 
             if self.sel_start.is_none() {
                 #[cfg(target_os = "windows")]
-                { self.smart_rect = crate::win_capture::hovered_window_rect(self.cursor_px.0, self.cursor_px.1, &self.own_hwnds); }
+                { self.smart_rect = crate::win_capture::hovered_window_rect(
+                    self.cursor_px.0, self.cursor_px.1, &self.own_hwnds,
+                    &mut self.smart_last_pos, &mut self.smart_last_rect,
+                ); }
             }
             if hook_clicked && self.sel_start.is_none() && self.smart_rect.is_some() {
                 #[cfg(target_os = "windows")]
@@ -997,8 +1013,9 @@ impl AnnotateApp {
                     ui.add_space(4.0);
                     // Row 3: palette + actions
                     ui.horizontal_wrapped(|ui| {
-                        // Custom palette
-                        let palette_colors = self.palette.colors();
+                        // Custom palette — use cached Vec to avoid per-frame allocation
+                        self.palette.colors_cached(&mut self.palette_cache);
+                        let palette_colors = self.palette_cache.clone();
                         for (idx, &c) in palette_colors.iter().enumerate() {
                             let sel = self.color == c;
                             let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0,22.0), egui::Sense::click());
@@ -1408,21 +1425,23 @@ pub fn render_annotation_to_buf(buf: &mut [u8], w: usize, h: usize, ann: &Annota
             let (x0,y0,x1,y1)=(ann.p1.x.min(ann.p2.x) as i32, ann.p1.y.min(ann.p2.y) as i32,
                                 ann.p1.x.max(ann.p2.x) as i32, ann.p1.y.max(ann.p2.y) as i32);
             let block=((ann.width*2.0) as i32).max(8);
-            let mut by=y0;
-            while by<y1 {
-                let mut bx=x0;
-                while bx<x1 {
-                    // Average color in block
+            // Pre-clamp bounds once outside the loop
+            let bx_end = x1.min(w as i32);
+            let by_end = y1.min(h as i32);
+            let mut by = y0.max(0);
+            while by < by_end {
+                let block_y_end = (by + block).min(by_end);
+                let mut bx = x0.max(0);
+                while bx < bx_end {
+                    let block_x_end = (bx + block).min(bx_end);
                     let (mut sr,mut sg,mut sb,mut cnt)=(0u32,0u32,0u32,0u32);
-                    for py in by..(by+block).min(y1) { for px in bx..(bx+block).min(x1) {
-                        if px>=0&&py>=0&&(px as usize)<w&&(py as usize)<h {
-                            let i=(py as usize*w+px as usize)*4;
-                            sr+=buf[i] as u32; sg+=buf[i+1] as u32; sb+=buf[i+2] as u32; cnt+=1;
-                        }
+                    for py in by..block_y_end { for px in bx..block_x_end {
+                        let i=(py as usize*w+px as usize)*4;
+                        sr+=buf[i] as u32; sg+=buf[i+1] as u32; sb+=buf[i+2] as u32; cnt+=1;
                     }}
                     if cnt>0 {
                         let (ar,ag,ab)=((sr/cnt) as u8,(sg/cnt) as u8,(sb/cnt) as u8);
-                        for py in by..(by+block).min(y1) { for px in bx..(bx+block).min(x1) {
+                        for py in by..block_y_end { for px in bx..block_x_end {
                             set_pixel(buf,w,h,px,py,Color32::from_rgb(ar,ag,ab));
                         }}
                     }

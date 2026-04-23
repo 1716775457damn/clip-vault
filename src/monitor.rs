@@ -12,28 +12,39 @@ pub fn start(tx: Sender<ClipContent>) {
         };
         let mut last_text = String::new();
         let mut last_img_hash: u64 = 0;
+        // Image polling is expensive; only check every IMG_INTERVAL ticks
+        const IMG_INTERVAL: u32 = 5;
+        let mut img_tick: u32 = 0;
 
         loop {
             thread::sleep(Duration::from_millis(200));
 
+            // ── Text (fast, check every tick) ─────────────────────────────────
             if let Ok(text) = clipboard.get_text() {
                 let text = text.trim().to_string();
                 if !text.is_empty() && (text.len() != last_text.len() || text != last_text) {
                     last_text = text.clone();
-                    // Exit loop if receiver is gone (app shut down)
                     if tx.send(ClipContent::Text(text)).is_err() { return; }
+                    // Text changed: skip image check this tick to reduce latency
+                    img_tick = img_tick.saturating_sub(1);
+                    continue;
                 }
             }
 
-            if let Ok(img) = clipboard.get_image() {
-                let hash = fnv1a(&img.bytes);
-                if hash != last_img_hash {
-                    last_img_hash = hash;
-                    if tx.send(ClipContent::Image {
-                        width: img.width as u32,
-                        height: img.height as u32,
-                        rgba: img.bytes.into_owned(),
-                    }).is_err() { return; }
+            // ── Image (slow, check every IMG_INTERVAL ticks) ──────────────────
+            img_tick += 1;
+            if img_tick >= IMG_INTERVAL {
+                img_tick = 0;
+                if let Ok(img) = clipboard.get_image() {
+                    let hash = fnv1a(&img.bytes);
+                    if hash != last_img_hash {
+                        last_img_hash = hash;
+                        if tx.send(ClipContent::Image {
+                            width:  img.width  as u32,
+                            height: img.height as u32,
+                            rgba:   img.bytes.into_owned(),
+                        }).is_err() { return; }
+                    }
                 }
             }
         }
@@ -41,12 +52,10 @@ pub fn start(tx: Sender<ClipContent>) {
 }
 
 /// Fast non-cryptographic hash for change detection.
-/// Only samples the first 8 KB + total length — sufficient for dedup,
-/// much faster than sampling the entire buffer for large images.
+/// Samples first 8 KB + total length — sufficient for dedup.
 fn fnv1a(data: &[u8]) -> u64 {
     const SAMPLE: usize = 8192;
     let mut h: u64 = 0xcbf29ce484222325;
-    // Mix in total length so images of different sizes never collide
     h ^= data.len() as u64;
     h = h.wrapping_mul(0x100000001b3);
     for &b in data.iter().take(SAMPLE) {
