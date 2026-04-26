@@ -69,14 +69,7 @@
             Display='expand'
             Absent='disallow'>
             <ComponentRef Id='ClipVaultExe'/>
-            <Feature
-                Id='StartMenu'
-                Title='Start Menu Shortcut'
-                Description='Add a shortcut to the Start Menu.'
-                Level='1'
-                Absent='allow'>
-                <ComponentRef Id='ApplicationShortcut'/>
-            </Feature>
+            <ComponentRef Id='ApplicationShortcut'/>
         </Feature>
 
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
