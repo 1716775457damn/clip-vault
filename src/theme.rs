@@ -1,7 +1,7 @@
 //! Theme definitions — dark and light variants.
 //! Both share the same spacing/typography; only Visuals differ.
 
-use egui::{Color32, CornerRadius, Margin, Stroke, Style, TextStyle, FontId, Visuals};
+use egui::{Color32, CornerRadius, Margin, Stroke, TextStyle, FontId, Visuals};
 
 pub fn apply_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();

@@ -372,6 +372,7 @@ pub struct AnnotateApp {
     tool_colors: ToolColors,
     palette:     Palette,
     palette_cache: Vec<Color32>, // cached Color32 list, rebuilt only when palette changes
+    #[allow(dead_code)]
     show_palette_editor: bool,
 
     history: Vec<HistoryEntry>, history_idx: Option<usize>,
@@ -415,7 +416,9 @@ pub struct AnnotateApp {
     pub tab_switch_needed: bool,
 
     // Saved window state for non-Windows overlay mode
+    #[allow(dead_code)]
     saved_window_pos: Option<Pos2>,
+    #[allow(dead_code)]
     saved_window_size: Option<Vec2>,
 }
 
@@ -461,7 +464,9 @@ impl Default for AnnotateApp {
 }
 
 impl AnnotateApp {
+    #[allow(dead_code)]
     pub fn is_selecting(&self) -> bool { self.capture_state == CaptureState::Selecting }
+    #[allow(dead_code)]
     pub fn trigger_capture(&mut self) {
         if self.capture_state == CaptureState::Idle { self.capture_btn_clicked = true; }
     }

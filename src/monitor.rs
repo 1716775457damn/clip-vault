@@ -52,15 +52,25 @@ pub fn start(tx: Sender<ClipContent>) {
 }
 
 /// Fast non-cryptographic hash for change detection.
-/// Samples first 8 KB + total length — sufficient for dedup.
+/// Samples first 8 KB + last 8 KB + total length — catches differences
+/// even when headers are identical.
 fn fnv1a(data: &[u8]) -> u64 {
     const SAMPLE: usize = 8192;
     let mut h: u64 = 0xcbf29ce484222325;
     h ^= data.len() as u64;
     h = h.wrapping_mul(0x100000001b3);
+    // Sample head
     for &b in data.iter().take(SAMPLE) {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
+    }
+    // Sample tail (catches changes beyond the header)
+    if data.len() > SAMPLE {
+        let tail_start = data.len().saturating_sub(SAMPLE);
+        for &b in data[tail_start..].iter() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
     }
     h
 }

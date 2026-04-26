@@ -25,6 +25,7 @@ pub struct SearchResult {
     pub file_size_str: String,
 }
 
+#[allow(dead_code)]
 pub fn search_filename(path: &Path, pattern: &Regex) -> Option<SearchResult> {
     let name = path.file_name()?.to_string_lossy();
     let name_nfc = nfc(name.as_ref());

@@ -177,6 +177,12 @@ fn atomic_copy(
     let tmp = dst.with_file_name(format!(
         "{}.svtmp", dst.file_name().unwrap_or_default().to_string_lossy()
     ));
+    // Read source file's actual mtime before copying
+    let src_mtime = std::fs::metadata(src)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|t| chrono::DateTime::<Local>::from(t))
+        .unwrap_or_else(Local::now);
     match std::fs::copy(src, &tmp) {
         Ok(bytes) => {
             if let Err(e) = std::fs::rename(&tmp, dst) {
@@ -185,7 +191,7 @@ fn atomic_copy(
                 return;
             }
             store.state.files.insert(rel.to_string(), FileRecord {
-                hash, size, modified: Local::now(),
+                hash, size, modified: src_mtime,
             });
             store.state.total_synced += 1;
             store.state.total_bytes  += bytes;
