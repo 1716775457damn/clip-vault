@@ -2,6 +2,7 @@
 name = "clip-vault"
 version = "0.3.0"
 edition = "2021"
+license = "MIT"
 
 [package.metadata.bundle]
 name = "Clip Vault"
