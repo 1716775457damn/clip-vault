@@ -1026,14 +1026,14 @@ impl eframe::App for App {
                     // Capture ready: restore window and go fullscreen for overlay
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    self.annotate.enter_overlay(ctx);
                     ctx.request_repaint();
                 }
                 // Poll for hotkey-triggered capture (window already minimized)
                 if self.annotate.poll_capture_hotkey() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    self.annotate.enter_overlay(ctx);
                     ctx.request_repaint();
                 }
                 self.annotate.editing_panel(ctx);

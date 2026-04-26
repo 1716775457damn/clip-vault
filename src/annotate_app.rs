@@ -413,6 +413,10 @@ pub struct AnnotateApp {
     super_active: bool,
     /// Set when super-capture completes, so App can switch to Annotate tab
     pub tab_switch_needed: bool,
+
+    // Saved window state for non-Windows overlay mode
+    saved_window_pos: Option<Pos2>,
+    saved_window_size: Option<Vec2>,
 }
 
 impl Default for AnnotateApp {
@@ -450,6 +454,8 @@ impl Default for AnnotateApp {
             super_texture: None, super_pixels: None,
             super_w: 0, super_h: 0, super_active: false,
             tab_switch_needed: false,
+            saved_window_pos: None,
+            saved_window_size: None,
         }
     }
 }
@@ -458,6 +464,49 @@ impl AnnotateApp {
     pub fn is_selecting(&self) -> bool { self.capture_state == CaptureState::Selecting }
     pub fn trigger_capture(&mut self) {
         if self.capture_state == CaptureState::Idle { self.capture_btn_clicked = true; }
+    }
+
+    pub fn enter_overlay(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Save current window state
+            ctx.input(|i| {
+                if let Some(pos) = i.viewport().outer_rect.map(|r| r.min) {
+                    self.saved_window_pos = Some(pos);
+                }
+                if let Some(rect) = i.viewport().inner_rect {
+                    self.saved_window_size = Some(rect.size());
+                }
+            });
+            // Cover the screen without native fullscreen
+            let screen = ctx.screen_rect();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(screen.min.x, screen.min.y)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(screen.size()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        }
+    }
+
+    pub fn exit_overlay(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+            if let Some(pos) = self.saved_window_pos.take() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            }
+            if let Some(size) = self.saved_window_size.take() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+        }
     }
 
     pub fn start_capture(&mut self) {
@@ -758,7 +807,7 @@ impl AnnotateApp {
                 self.capture_state=CaptureState::Idle;
                 self.full_pixels=None; self.full_texture=None; self.smart_rect=None;
                 self.status=String::new();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                self.exit_overlay(ctx);
                 return false;
             }
             if self.full_texture.is_none() {
@@ -830,7 +879,7 @@ impl AnnotateApp {
             if hook_clicked && self.sel_start.is_none() && self.smart_rect.is_some() {
                 #[cfg(target_os = "windows")]
                 if let Some(ref hook) = self.mouse_hook { hook.consume_click(); }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                self.exit_overlay(ctx);
                 self.commit_selection(ctx); return false;
             }
 
@@ -876,7 +925,7 @@ impl AnnotateApp {
                 }
                 if resp.drag_stopped() {
                     self.sel_cur=resp.interact_pointer_pos();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    self.exit_overlay(ctx);
                     self.commit_selection(ctx); return;
                 }
 
@@ -1310,7 +1359,7 @@ impl AnnotateApp {
                     self.super_active = true;
                     // Consume the click so it doesn't trigger other things
                     if let Some(ref hook) = self.super_hook_mouse { hook.consume_click(); }
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    self.enter_overlay(ctx);
                     ctx.request_repaint();
                 }
             } else if self.super_active {
@@ -1321,7 +1370,7 @@ impl AnnotateApp {
                 if ms.released {
                     // Drag ended: commit selection
                     if let Some(ref hook) = self.super_hook_mouse { hook.consume_release(); }
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    self.exit_overlay(ctx);
                     self.commit_super_selection();
                 }
             }
@@ -1364,7 +1413,7 @@ impl AnnotateApp {
 
     #[cfg(target_os = "windows")]
     fn cancel_super_capture(&mut self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        self.exit_overlay(ctx);
         self.cancel_super_capture_silent();
     }
 
