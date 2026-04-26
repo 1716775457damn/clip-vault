@@ -1,0 +1,96 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  Copyright (C) 2025 Clip Vault Contributors
+  Licensed under MIT
+-->
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+    <Product
+        Id='*'
+        Name='Clip Vault'
+        UpgradeCode='B0E5A3F1-6C7D-4E8A-9F2B-1A3C5D7E9F0B'
+        Manufacturer='Clip Vault Contributors'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='Clip Vault - Clipboard manager with search, sync and screenshot'
+            Manufacturer='Clip Vault Contributors'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            SummaryCodepage='1252'
+            Platform='x64'/>
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Property Id='DiskPrompt' Value='Clip Vault Installation'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='ProgramFiles64Folder' Name='PFiles'>
+                <Directory Id='APPLICATIONFOLDER' Name='Clip Vault'>
+                    <Component Id='ClipVaultExe' Guid='A1B2C3D4-E5F6-7890-ABCD-EF1234567890' Win64='yes'>
+                        <File
+                            Id='exe0'
+                            Name='clip-vault.exe'
+                            DiskId='1'
+                            Source='$(var.CargoTargetBinDir)\clip-vault.exe'
+                            KeyPath='yes'/>
+                    </Component>
+                </Directory>
+            </Directory>
+            <Directory Id='ProgramMenuFolder'>
+                <Directory Id='ApplicationProgramsFolder' Name='Clip Vault'>
+                    <Component Id='ApplicationShortcut' Guid='B2C3D4E5-F6A7-8901-BCDE-F12345678901' Win64='yes'>
+                        <Shortcut Id='ApplicationStartMenuShortcut'
+                            Name='Clip Vault'
+                            Description='Clipboard manager with search, sync and screenshot'
+                            Target='[#exe0]'
+                            WorkingDirectory='APPLICATIONFOLDER'/>
+                        <RemoveFolder Id='CleanUpShortCut' Directory='ApplicationProgramsFolder' On='uninstall'/>
+                        <RegistryValue Root='HKCU' Key='Software\ClipVault' Name='installed' Type='integer' Value='1' KeyPath='yes'/>
+                    </Component>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id='Binaries'
+            Title='Application'
+            Description='Installs Clip Vault.'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+            <ComponentRef Id='ClipVaultExe'/>
+            <Feature
+                Id='StartMenu'
+                Title='Start Menu Shortcut'
+                Description='Add a shortcut to the Start Menu.'
+                Level='1'
+                Absent='allow'>
+                <ComponentRef Id='ApplicationShortcut'/>
+            </Feature>
+        </Feature>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+
+        <Icon Id='ProductICO' SourceFile='$(var.CargoTargetBinDir)\clip-vault.exe'/>
+        <Property Id='ARPPRODUCTICON' Value='ProductICO'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/1716775457damn/clip-vault'/>
+
+        <UI>
+            <UIRef Id='WixUI_InstallDir'/>
+            <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='InstallDirDlg' Order='2'>1</Publish>
+            <Publish Dialog='InstallDirDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='2'>1</Publish>
+        </UI>
+        <Property Id='WIXUI_INSTALLDIR' Value='APPLICATIONFOLDER'/>
+        <WixVariable Id='WixUILicenseRtf' Value='wix\License.rtf'/>
+    </Product>
+</Wix>

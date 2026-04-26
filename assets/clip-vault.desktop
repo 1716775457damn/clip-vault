@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Clip Vault
+Comment=Clipboard manager with search, sync and screenshot
+Exec=clip-vault
+Icon=clip-vault
+Type=Application
+Categories=Utility;
+Terminal=false

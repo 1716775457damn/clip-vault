@@ -52,6 +52,34 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
+[package.metadata.deb]
+maintainer = "Clip Vault Contributors"
+copyright = "MIT 2025"
+depends = "$auto"
+section = "utility"
+priority = "optional"
+assets = [
+    ["target/x86_64-unknown-linux-gnu/release/clip-vault", "usr/bin/", "755"],
+    ["assets/clip-vault.desktop", "usr/share/applications/", "644"],
+    ["assets/clip-vault.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/clip-vault", dest = "/usr/bin/clip-vault", mode = "755" },
+    { source = "assets/clip-vault.desktop", dest = "/usr/share/applications/clip-vault.desktop", mode = "644" },
+    { source = "assets/clip-vault.png", dest = "/usr/share/icons/hicolor/256x256/apps/clip-vault.png", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+gtk3 = "*"
+libxcb = "*"
+dbus-libs = "*"
+libayatana-appindicator-gtk3 = "*"
+libxdo = "*"
+libxkbcommon = "*"
+openssl-libs = "*"
+
 [profile.release]
 opt-level = 3
 lto = true

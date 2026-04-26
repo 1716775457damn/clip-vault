@@ -472,10 +472,46 @@ impl AnnotateApp {
                 let _ = tx.send(CaptureResult { pixels, width: w, height: h }); return;
             }
             if let Ok(screens) = screenshots::Screen::all() {
-                if let Some(screen) = screens.into_iter().next() {
-                    if let Ok(img) = screen.capture() {
-                        let w = img.width() as usize; let h = img.height() as usize;
-                        let _ = tx.send(CaptureResult { pixels: img.into_raw(), width: w, height: h });
+                if screens.len() == 1 {
+                    // Single monitor: fast path (unchanged behavior)
+                    if let Some(screen) = screens.into_iter().next() {
+                        if let Ok(img) = screen.capture() {
+                            let w = img.width() as usize; let h = img.height() as usize;
+                            let _ = tx.send(CaptureResult { pixels: img.into_raw(), width: w, height: h });
+                        }
+                    }
+                } else if !screens.is_empty() {
+                    // Multi-monitor: composite all screens
+                    let mut captures: Vec<(i32, i32, usize, usize, Vec<u8>)> = Vec::new();
+                    let mut min_x = i32::MAX; let mut min_y = i32::MAX;
+                    let mut max_x = i32::MIN; let mut max_y = i32::MIN;
+                    for screen in &screens {
+                        let info = screen.display_info;
+                        let x = info.x; let y = info.y;
+                        if let Ok(img) = screen.capture() {
+                            let sw = img.width() as usize; let sh = img.height() as usize;
+                            min_x = min_x.min(x); min_y = min_y.min(y);
+                            max_x = max_x.max(x + sw as i32); max_y = max_y.max(y + sh as i32);
+                            captures.push((x, y, sw, sh, img.into_raw()));
+                        }
+                    }
+                    if !captures.is_empty() {
+                        let total_w = (max_x - min_x) as usize;
+                        let total_h = (max_y - min_y) as usize;
+                        let mut composite = vec![0u8; total_w * total_h * 4];
+                        for (sx, sy, sw, sh, pixels) in &captures {
+                            let ox = (*sx - min_x) as usize;
+                            let oy = (*sy - min_y) as usize;
+                            for row in 0..*sh {
+                                let src_start = row * sw * 4;
+                                let dst_start = ((oy + row) * total_w + ox) * 4;
+                                let len = sw * 4;
+                                if src_start + len <= pixels.len() && dst_start + len <= composite.len() {
+                                    composite[dst_start..dst_start + len].copy_from_slice(&pixels[src_start..src_start + len]);
+                                }
+                            }
+                        }
+                        let _ = tx.send(CaptureResult { pixels: composite, width: total_w, height: total_h });
                     }
                 }
             }
@@ -496,10 +532,46 @@ impl AnnotateApp {
                 let _ = tx.send(CaptureResult { pixels, width: w, height: h }); return;
             }
             if let Ok(screens) = screenshots::Screen::all() {
-                if let Some(screen) = screens.into_iter().next() {
-                    if let Ok(img) = screen.capture() {
-                        let w = img.width() as usize; let h = img.height() as usize;
-                        let _ = tx.send(CaptureResult { pixels: img.into_raw(), width: w, height: h });
+                if screens.len() == 1 {
+                    // Single monitor: fast path (unchanged behavior)
+                    if let Some(screen) = screens.into_iter().next() {
+                        if let Ok(img) = screen.capture() {
+                            let w = img.width() as usize; let h = img.height() as usize;
+                            let _ = tx.send(CaptureResult { pixels: img.into_raw(), width: w, height: h });
+                        }
+                    }
+                } else if !screens.is_empty() {
+                    // Multi-monitor: composite all screens
+                    let mut captures: Vec<(i32, i32, usize, usize, Vec<u8>)> = Vec::new();
+                    let mut min_x = i32::MAX; let mut min_y = i32::MAX;
+                    let mut max_x = i32::MIN; let mut max_y = i32::MIN;
+                    for screen in &screens {
+                        let info = screen.display_info;
+                        let x = info.x; let y = info.y;
+                        if let Ok(img) = screen.capture() {
+                            let sw = img.width() as usize; let sh = img.height() as usize;
+                            min_x = min_x.min(x); min_y = min_y.min(y);
+                            max_x = max_x.max(x + sw as i32); max_y = max_y.max(y + sh as i32);
+                            captures.push((x, y, sw, sh, img.into_raw()));
+                        }
+                    }
+                    if !captures.is_empty() {
+                        let total_w = (max_x - min_x) as usize;
+                        let total_h = (max_y - min_y) as usize;
+                        let mut composite = vec![0u8; total_w * total_h * 4];
+                        for (sx, sy, sw, sh, pixels) in &captures {
+                            let ox = (*sx - min_x) as usize;
+                            let oy = (*sy - min_y) as usize;
+                            for row in 0..*sh {
+                                let src_start = row * sw * 4;
+                                let dst_start = ((oy + row) * total_w + ox) * 4;
+                                let len = sw * 4;
+                                if src_start + len <= pixels.len() && dst_start + len <= composite.len() {
+                                    composite[dst_start..dst_start + len].copy_from_slice(&pixels[src_start..src_start + len]);
+                                }
+                            }
+                        }
+                        let _ = tx.send(CaptureResult { pixels: composite, width: total_w, height: total_h });
                     }
                 }
             }
@@ -623,14 +695,14 @@ impl AnnotateApp {
         if let Some(ref base) = self.pixels {
             let mut buf = base.clone();
             let (w,h)=(self.img_w,self.img_h);
-            for ann in &self.annotations { render_annotation_to_buf(&mut buf, w, h, ann); }
+            for ann in &self.annotations { render_annotation_to_buf(&mut buf, w, h, ann, Some(base.as_slice())); }
             self.baked=Some(buf);
         }
     }
     fn bake_last(&mut self) {
         if let (Some(ref mut baked), Some(ann)) = (&mut self.baked, self.annotations.last()) {
             let (w,h)=(self.img_w,self.img_h);
-            render_annotation_to_buf(baked, w, h, ann);
+            render_annotation_to_buf(baked, w, h, ann, self.pixels.as_deref());
         }
     }
     pub fn save_png(&self, path: &std::path::Path) -> anyhow::Result<()> {
@@ -1521,7 +1593,233 @@ fn draw_stroked_rect(painter: &egui::Painter, r: Rect, rounding: f32, stroke: St
 
 // ── Pixel-level drawing ───────────────────────────────────────────────────────
 
-pub fn render_annotation_to_buf(buf: &mut [u8], w: usize, h: usize, ann: &Annotation) {
+// 5×7 bitmap font for printable ASCII (chars 32..=126).
+// Each glyph is [u8; 7] where each u8 encodes a row of 5 bits (MSB = leftmost pixel).
+const BITMAP_FONT: [[u8; 7]; 95] = [
+    // 32 ' ' (space)
+    [0x00,0x00,0x00,0x00,0x00,0x00,0x00],
+    // 33 '!'
+    [0x04,0x04,0x04,0x04,0x04,0x00,0x04],
+    // 34 '"'
+    [0x0A,0x0A,0x0A,0x00,0x00,0x00,0x00],
+    // 35 '#'
+    [0x0A,0x0A,0x1F,0x0A,0x1F,0x0A,0x0A],
+    // 36 '$'
+    [0x04,0x0F,0x14,0x0E,0x05,0x1E,0x04],
+    // 37 '%'
+    [0x18,0x19,0x02,0x04,0x08,0x13,0x03],
+    // 38 '&'
+    [0x0C,0x12,0x14,0x08,0x15,0x12,0x0D],
+    // 39 '''
+    [0x04,0x04,0x08,0x00,0x00,0x00,0x00],
+    // 40 '('
+    [0x02,0x04,0x08,0x08,0x08,0x04,0x02],
+    // 41 ')'
+    [0x08,0x04,0x02,0x02,0x02,0x04,0x08],
+    // 42 '*'
+    [0x00,0x04,0x15,0x0E,0x15,0x04,0x00],
+    // 43 '+'
+    [0x00,0x04,0x04,0x1F,0x04,0x04,0x00],
+    // 44 ','
+    [0x00,0x00,0x00,0x00,0x00,0x04,0x08],
+    // 45 '-'
+    [0x00,0x00,0x00,0x1F,0x00,0x00,0x00],
+    // 46 '.'
+    [0x00,0x00,0x00,0x00,0x00,0x00,0x04],
+    // 47 '/'
+    [0x00,0x01,0x02,0x04,0x08,0x10,0x00],
+    // 48 '0'
+    [0x0E,0x11,0x13,0x15,0x19,0x11,0x0E],
+    // 49 '1'
+    [0x04,0x0C,0x04,0x04,0x04,0x04,0x0E],
+    // 50 '2'
+    [0x0E,0x11,0x01,0x02,0x04,0x08,0x1F],
+    // 51 '3'
+    [0x1F,0x02,0x04,0x02,0x01,0x11,0x0E],
+    // 52 '4'
+    [0x02,0x06,0x0A,0x12,0x1F,0x02,0x02],
+    // 53 '5'
+    [0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E],
+    // 54 '6'
+    [0x06,0x08,0x10,0x1E,0x11,0x11,0x0E],
+    // 55 '7'
+    [0x1F,0x01,0x02,0x04,0x08,0x08,0x08],
+    // 56 '8'
+    [0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E],
+    // 57 '9'
+    [0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C],
+    // 58 ':'
+    [0x00,0x00,0x04,0x00,0x04,0x00,0x00],
+    // 59 ';'
+    [0x00,0x00,0x04,0x00,0x04,0x04,0x08],
+    // 60 '<'
+    [0x02,0x04,0x08,0x10,0x08,0x04,0x02],
+    // 61 '='
+    [0x00,0x00,0x1F,0x00,0x1F,0x00,0x00],
+    // 62 '>'
+    [0x08,0x04,0x02,0x01,0x02,0x04,0x08],
+    // 63 '?'
+    [0x0E,0x11,0x01,0x02,0x04,0x00,0x04],
+    // 64 '@'
+    [0x0E,0x11,0x17,0x15,0x17,0x10,0x0E],
+    // 65 'A'
+    [0x0E,0x11,0x11,0x1F,0x11,0x11,0x11],
+    // 66 'B'
+    [0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E],
+    // 67 'C'
+    [0x0E,0x11,0x10,0x10,0x10,0x11,0x0E],
+    // 68 'D'
+    [0x1C,0x12,0x11,0x11,0x11,0x12,0x1C],
+    // 69 'E'
+    [0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F],
+    // 70 'F'
+    [0x1F,0x10,0x10,0x1E,0x10,0x10,0x10],
+    // 71 'G'
+    [0x0E,0x11,0x10,0x17,0x11,0x11,0x0F],
+    // 72 'H'
+    [0x11,0x11,0x11,0x1F,0x11,0x11,0x11],
+    // 73 'I'
+    [0x0E,0x04,0x04,0x04,0x04,0x04,0x0E],
+    // 74 'J'
+    [0x07,0x02,0x02,0x02,0x02,0x12,0x0C],
+    // 75 'K'
+    [0x11,0x12,0x14,0x18,0x14,0x12,0x11],
+    // 76 'L'
+    [0x10,0x10,0x10,0x10,0x10,0x10,0x1F],
+    // 77 'M'
+    [0x11,0x1B,0x15,0x15,0x11,0x11,0x11],
+    // 78 'N'
+    [0x11,0x11,0x19,0x15,0x13,0x11,0x11],
+    // 79 'O'
+    [0x0E,0x11,0x11,0x11,0x11,0x11,0x0E],
+    // 80 'P'
+    [0x1E,0x11,0x11,0x1E,0x10,0x10,0x10],
+    // 81 'Q'
+    [0x0E,0x11,0x11,0x11,0x15,0x12,0x0D],
+    // 82 'R'
+    [0x1E,0x11,0x11,0x1E,0x14,0x12,0x11],
+    // 83 'S'
+    [0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E],
+    // 84 'T'
+    [0x1F,0x04,0x04,0x04,0x04,0x04,0x04],
+    // 85 'U'
+    [0x11,0x11,0x11,0x11,0x11,0x11,0x0E],
+    // 86 'V'
+    [0x11,0x11,0x11,0x11,0x11,0x0A,0x04],
+    // 87 'W'
+    [0x11,0x11,0x11,0x15,0x15,0x15,0x0A],
+    // 88 'X'
+    [0x11,0x11,0x0A,0x04,0x0A,0x11,0x11],
+    // 89 'Y'
+    [0x11,0x11,0x11,0x0A,0x04,0x04,0x04],
+    // 90 'Z'
+    [0x1F,0x01,0x02,0x04,0x08,0x10,0x1F],
+    // 91 '['
+    [0x0E,0x08,0x08,0x08,0x08,0x08,0x0E],
+    // 92 '\'
+    [0x00,0x10,0x08,0x04,0x02,0x01,0x00],
+    // 93 ']'
+    [0x0E,0x02,0x02,0x02,0x02,0x02,0x0E],
+    // 94 '^'
+    [0x04,0x0A,0x11,0x00,0x00,0x00,0x00],
+    // 95 '_'
+    [0x00,0x00,0x00,0x00,0x00,0x00,0x1F],
+    // 96 '`'
+    [0x08,0x04,0x02,0x00,0x00,0x00,0x00],
+    // 97 'a'
+    [0x00,0x00,0x0E,0x01,0x0F,0x11,0x0F],
+    // 98 'b'
+    [0x10,0x10,0x16,0x19,0x11,0x11,0x1E],
+    // 99 'c'
+    [0x00,0x00,0x0E,0x10,0x10,0x11,0x0E],
+    // 100 'd'
+    [0x01,0x01,0x0D,0x13,0x11,0x11,0x0F],
+    // 101 'e'
+    [0x00,0x00,0x0E,0x11,0x1F,0x10,0x0E],
+    // 102 'f'
+    [0x06,0x09,0x08,0x1C,0x08,0x08,0x08],
+    // 103 'g'
+    [0x00,0x0F,0x11,0x11,0x0F,0x01,0x0E],
+    // 104 'h'
+    [0x10,0x10,0x16,0x19,0x11,0x11,0x11],
+    // 105 'i'
+    [0x04,0x00,0x0C,0x04,0x04,0x04,0x0E],
+    // 106 'j'
+    [0x02,0x00,0x06,0x02,0x02,0x12,0x0C],
+    // 107 'k'
+    [0x10,0x10,0x12,0x14,0x18,0x14,0x12],
+    // 108 'l'
+    [0x0C,0x04,0x04,0x04,0x04,0x04,0x0E],
+    // 109 'm'
+    [0x00,0x00,0x1A,0x15,0x15,0x11,0x11],
+    // 110 'n'
+    [0x00,0x00,0x16,0x19,0x11,0x11,0x11],
+    // 111 'o'
+    [0x00,0x00,0x0E,0x11,0x11,0x11,0x0E],
+    // 112 'p'
+    [0x00,0x00,0x1E,0x11,0x1E,0x10,0x10],
+    // 113 'q'
+    [0x00,0x00,0x0D,0x13,0x0F,0x01,0x01],
+    // 114 'r'
+    [0x00,0x00,0x16,0x19,0x10,0x10,0x10],
+    // 115 's'
+    [0x00,0x00,0x0E,0x10,0x0E,0x01,0x1E],
+    // 116 't'
+    [0x08,0x08,0x1C,0x08,0x08,0x09,0x06],
+    // 117 'u'
+    [0x00,0x00,0x11,0x11,0x11,0x13,0x0D],
+    // 118 'v'
+    [0x00,0x00,0x11,0x11,0x11,0x0A,0x04],
+    // 119 'w'
+    [0x00,0x00,0x11,0x11,0x15,0x15,0x0A],
+    // 120 'x'
+    [0x00,0x00,0x11,0x0A,0x04,0x0A,0x11],
+    // 121 'y'
+    [0x00,0x00,0x11,0x11,0x0F,0x01,0x0E],
+    // 122 'z'
+    [0x00,0x00,0x1F,0x02,0x04,0x08,0x1F],
+    // 123 '{'
+    [0x02,0x04,0x04,0x08,0x04,0x04,0x02],
+    // 124 '|'
+    [0x04,0x04,0x04,0x04,0x04,0x04,0x04],
+    // 125 '}'
+    [0x08,0x04,0x04,0x02,0x04,0x04,0x08],
+    // 126 '~'
+    [0x00,0x04,0x15,0x0E,0x00,0x00,0x00],
+];
+
+fn draw_bitmap_char(buf: &mut [u8], w: usize, h: usize, ch: char, x: i32, y: i32, color: Color32, scale: i32) {
+    let idx = ch as usize;
+    let glyph = if idx >= 32 && idx <= 126 {
+        &BITMAP_FONT[idx - 32]
+    } else {
+        &BITMAP_FONT[0] // fallback to space for unsupported chars
+    };
+    for row in 0..7 {
+        let bits = glyph[row];
+        for col in 0..5 {
+            if bits & (0x10 >> col) != 0 {
+                // Draw a scale×scale block for this pixel
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        set_pixel(buf, w, h, x + col as i32 * scale + sx, y + row as i32 * scale + sy, color);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn draw_bitmap_text(buf: &mut [u8], w: usize, h: usize, text: &str, x: i32, y: i32, color: Color32, font_size: f32) {
+    let scale = (font_size / 7.0).max(1.0) as i32;
+    let mut cx = x;
+    for ch in text.chars() {
+        draw_bitmap_char(buf, w, h, ch, cx, y, color, scale);
+        cx += 6 * scale; // 5 pixels + 1 gap
+    }
+}
+
+pub fn render_annotation_to_buf(buf: &mut [u8], w: usize, h: usize, ann: &Annotation, base_pixels: Option<&[u8]>) {
     match ann.kind {
         ShapeKind::Rect | ShapeKind::RoundRect => {
             let (x0,y0,x1,y1)=(ann.p1.x.min(ann.p2.x) as i32, ann.p1.y.min(ann.p2.y) as i32,
@@ -1575,18 +1873,45 @@ pub fn render_annotation_to_buf(buf: &mut [u8], w: usize, h: usize, ann: &Annota
             }
         }
         ShapeKind::Eraser => {
-            // Eraser: restore original pixels (we don't have original here, use white)
             let (x0,y0,x1,y1)=(ann.p1.x.min(ann.p2.x) as i32, ann.p1.y.min(ann.p2.y) as i32,
                                 ann.p1.x.max(ann.p2.x) as i32, ann.p1.y.max(ann.p2.y) as i32);
-            fill_rect_alpha(buf,w,h,x0,y0,x1,y1,Color32::WHITE);
+            if let Some(base) = base_pixels {
+                // Restore original pixels from base image
+                let cx0 = x0.max(0) as usize;
+                let cy0 = y0.max(0) as usize;
+                let cx1 = (x1 as usize).min(w);
+                let cy1 = (y1 as usize).min(h);
+                for py in cy0..cy1 {
+                    for px in cx0..cx1 {
+                        let i = (py * w + px) * 4;
+                        if i + 4 <= base.len() && i + 4 <= buf.len() {
+                            buf[i]     = base[i];
+                            buf[i + 1] = base[i + 1];
+                            buf[i + 2] = base[i + 2];
+                            buf[i + 3] = base[i + 3];
+                        }
+                    }
+                }
+            } else {
+                // Fallback: fill with white if no base pixels available
+                fill_rect_alpha(buf,w,h,x0,y0,x1,y1,Color32::WHITE);
+            }
         }
         ShapeKind::Text => {
-            // Text rendering to pixel buffer is complex; skip (egui handles display)
+            draw_bitmap_text(buf, w, h, &ann.text, ann.p1.x as i32, ann.p1.y as i32, ann.color, ann.width * 4.0);
         }
         ShapeKind::Number => {
             let cx=((ann.p1.x+ann.p2.x)/2.0) as i32; let cy=((ann.p1.y+ann.p2.y)/2.0) as i32;
             let r=((ann.p2-ann.p1).length()/2.0) as i32;
             draw_filled_circle(buf,w,h,cx,cy,r,ann.color);
+            let digit_str = ann.number.to_string();
+            let font_size = (r as f32 * 1.2).max(7.0);
+            let scale = (font_size / 7.0).max(1.0) as i32;
+            let text_w = digit_str.len() as i32 * 6 * scale;
+            let text_h = 7 * scale;
+            let tx = cx - text_w / 2;
+            let ty = cy - text_h / 2;
+            draw_bitmap_text(buf, w, h, &digit_str, tx, ty, Color32::WHITE, font_size);
         }
     }
 }
@@ -1680,5 +2005,367 @@ fn draw_arrow_buf(buf:&mut[u8],w:usize,h:usize,p1:Pos2,p2:Pos2,c:Color32,lw:i32,
         let bx2=Pos2::new(p1.x+head*(ux*angle.cos()+uy*angle.sin()),p1.y+head*(-ux*angle.sin()+uy*angle.cos()));
         draw_line_thick(buf,w,h,p1,bx1,c,lw);
         draw_line_thick(buf,w,h,p1,bx2,c,lw);
+    }
+}
+
+
+// ── Bug condition exploration tests ───────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Color32, Pos2};
+
+    /// Helper: create a w×h RGBA buffer filled with a single color.
+    fn make_filled_buf(w: usize, h: usize, c: Color32) -> Vec<u8> {
+        let mut buf = vec![0u8; w * h * 4];
+        for i in 0..(w * h) {
+            buf[i * 4]     = c.r();
+            buf[i * 4 + 1] = c.g();
+            buf[i * 4 + 2] = c.b();
+            buf[i * 4 + 3] = c.a();
+        }
+        buf
+    }
+
+    /// Bug exploration: Eraser fills white instead of restoring original pixels.
+    ///
+    /// We create a 100×100 red buffer, apply an eraser annotation over a region,
+    /// then assert the erased pixels still match the original red. On unfixed code
+    /// this FAILS because the eraser fills with white [255,255,255,255].
+    ///
+    /// **Validates: Requirements 1.1**
+    #[test]
+    fn test_eraser_fills_white_bug() {
+        let w = 100usize;
+        let h = 100usize;
+        let red = Color32::from_rgb(255, 0, 0);
+
+        // Create a red-filled buffer (simulating a red screenshot)
+        let mut buf = make_filled_buf(w, h, red);
+
+        // Create eraser annotation covering region (10,10) to (30,30)
+        let ann = Annotation::new(
+            ShapeKind::Eraser,
+            Color32::WHITE,
+            10.0,
+            false,
+            LineStyle::Solid,
+            Pos2::new(10.0, 10.0),
+            Pos2::new(30.0, 30.0),
+        );
+
+        // Keep a copy of the original red buffer as base_pixels
+        let base_pixels = buf.clone();
+
+        // Render the eraser on the buffer with base_pixels for restoration
+        render_annotation_to_buf(&mut buf, w, h, &ann, Some(base_pixels.as_slice()));
+
+        // Assert: erased pixels should NOT be white — they should be the original red.
+        // On unfixed code, the eraser fills with white, so this assertion FAILS.
+        let mut found_white = false;
+        for y in 10..=30 {
+            for x in 10..=30 {
+                let i = (y * w + x) * 4;
+                if buf[i] == 255 && buf[i + 1] == 255 && buf[i + 2] == 255 && buf[i + 3] == 255 {
+                    found_white = true;
+                }
+            }
+        }
+        assert!(
+            !found_white,
+            "BUG CONFIRMED: Eraser filled pixels with white instead of restoring original red pixels"
+        );
+    }
+
+    /// Bug exploration: Text annotations are not rendered to the export buffer.
+    ///
+    /// We create a 100×100 black buffer, apply a text annotation "A", then assert
+    /// that at least some pixels in the text region differ from black. On unfixed
+    /// code this FAILS because the Text arm is a no-op.
+    ///
+    /// **Validates: Requirements 1.2**
+    #[test]
+    fn test_text_not_rendered_bug() {
+        let w = 100usize;
+        let h = 100usize;
+        let black = Color32::from_rgb(0, 0, 0);
+
+        let mut buf = make_filled_buf(w, h, black);
+        let snapshot_before = buf.clone();
+
+        // Create text annotation "A" in red at position (10,10)-(50,50)
+        let mut ann = Annotation::new(
+            ShapeKind::Text,
+            Color32::from_rgb(255, 0, 0),
+            16.0,
+            false,
+            LineStyle::Solid,
+            Pos2::new(10.0, 10.0),
+            Pos2::new(50.0, 50.0),
+        );
+        ann.text = "A".to_string();
+
+        render_annotation_to_buf(&mut buf, w, h, &ann, None);
+
+        // Assert: at least some pixels should have changed (text was rendered).
+        // On unfixed code, NO pixels change because the Text arm is empty.
+        let pixels_changed = buf.iter()
+            .zip(snapshot_before.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+
+        assert!(
+            pixels_changed > 0,
+            "BUG CONFIRMED: Text annotation produced zero pixel changes — text is not rendered to export buffer"
+        );
+    }
+
+    /// Bug exploration: Number annotations render the circle but not the digit.
+    ///
+    /// We create a 100×100 black buffer, apply a number annotation with number=3,
+    /// then check for white pixels in the center area of the circle (the digit).
+    /// On unfixed code this FAILS because no digit is rendered — only the colored
+    /// circle background.
+    ///
+    /// **Validates: Requirements 1.3**
+    #[test]
+    fn test_number_no_digit_bug() {
+        let w = 100usize;
+        let h = 100usize;
+        let black = Color32::from_rgb(0, 0, 0);
+
+        let mut buf = make_filled_buf(w, h, black);
+
+        // Create number annotation with number=3, blue circle
+        // p1=(30,30), p2=(60,60) → center=(45,45), radius≈21
+        let mut ann = Annotation::new(
+            ShapeKind::Number,
+            Color32::from_rgb(0, 0, 255),
+            10.0,
+            false,
+            LineStyle::Solid,
+            Pos2::new(30.0, 30.0),
+            Pos2::new(60.0, 60.0),
+        );
+        ann.number = 3;
+
+        render_annotation_to_buf(&mut buf, w, h, &ann, None);
+
+        // Check for white pixels in the center area (where the digit "3" should be).
+        // The circle center is at (45,45). Check a small region around center for
+        // white pixels that would form the digit.
+        let mut white_pixel_count = 0;
+        for y in 40..=50 {
+            for x in 40..=50 {
+                let i = (y * w + x) * 4;
+                if buf[i] == 255 && buf[i + 1] == 255 && buf[i + 2] == 255 && buf[i + 3] == 255 {
+                    white_pixel_count += 1;
+                }
+            }
+        }
+
+        assert!(
+            white_pixel_count > 0,
+            "BUG CONFIRMED: Number annotation has no white digit pixels in center — digit '3' is not rendered"
+        );
+    }
+
+    // ── Preservation property tests ───────────────────────────────────────────
+    // These tests verify that existing (non-buggy) annotation rendering works
+    // correctly and will continue to work after the bugfix.
+    //
+    // **Validates: Requirements 3.1, 3.2, 3.6**
+
+    /// Preservation: Rect rendering produces expected red pixels in the filled region.
+    #[test]
+    fn test_rect_rendering_preserved() {
+        let w = 100usize;
+        let h = 100usize;
+        let black = Color32::from_rgb(0, 0, 0);
+        let red = Color32::from_rgb(255, 0, 0);
+
+        let mut buf = make_filled_buf(w, h, black);
+
+        // Filled red rectangle from (10,10) to (50,50)
+        let ann = Annotation::new(
+            ShapeKind::Rect,
+            red,
+            2.0,
+            true,
+            LineStyle::Solid,
+            Pos2::new(10.0, 10.0),
+            Pos2::new(50.0, 50.0),
+        );
+
+        render_annotation_to_buf(&mut buf, w, h, &ann, None);
+
+        // Verify pixels inside the rect are red
+        for y in 10..=50 {
+            for x in 10..=50 {
+                let i = (y * w + x) * 4;
+                assert_eq!(buf[i], 255, "Rect pixel ({x},{y}) R channel should be 255");
+                assert_eq!(buf[i + 1], 0, "Rect pixel ({x},{y}) G channel should be 0");
+                assert_eq!(buf[i + 2], 0, "Rect pixel ({x},{y}) B channel should be 0");
+                assert_eq!(buf[i + 3], 255, "Rect pixel ({x},{y}) A channel should be 255");
+            }
+        }
+
+        // Verify a pixel outside the rect is still black
+        let i = (0 * w + 0) * 4;
+        assert_eq!(buf[i], 0, "Pixel outside rect should remain black");
+        assert_eq!(buf[i + 1], 0);
+        assert_eq!(buf[i + 2], 0);
+    }
+
+    /// Preservation: Ellipse rendering produces expected blue pixels at the center.
+    #[test]
+    fn test_ellipse_rendering_preserved() {
+        let w = 100usize;
+        let h = 100usize;
+        let black = Color32::from_rgb(0, 0, 0);
+        let blue = Color32::from_rgb(0, 0, 255);
+
+        let mut buf = make_filled_buf(w, h, black);
+
+        // Filled blue ellipse: p1=(30,30), p2=(70,70) → center=(50,50), rx=20, ry=20
+        let ann = Annotation::new(
+            ShapeKind::Ellipse,
+            blue,
+            2.0,
+            true,
+            LineStyle::Solid,
+            Pos2::new(30.0, 30.0),
+            Pos2::new(70.0, 70.0),
+        );
+
+        render_annotation_to_buf(&mut buf, w, h, &ann, None);
+
+        // The center pixel (50,50) must be blue
+        let i = (50 * w + 50) * 4;
+        assert_eq!(buf[i], 0, "Ellipse center R should be 0");
+        assert_eq!(buf[i + 1], 0, "Ellipse center G should be 0");
+        assert_eq!(buf[i + 2], 255, "Ellipse center B should be 255");
+        assert_eq!(buf[i + 3], 255, "Ellipse center A should be 255");
+
+        // A pixel well outside the ellipse should still be black
+        let i_out = (0 * w + 0) * 4;
+        assert_eq!(buf[i_out], 0, "Pixel outside ellipse should remain black");
+    }
+
+    /// Preservation: Line rendering modifies pixels along the diagonal.
+    #[test]
+    fn test_line_rendering_preserved() {
+        let w = 100usize;
+        let h = 100usize;
+        let black = Color32::from_rgb(0, 0, 0);
+        let green = Color32::from_rgb(0, 255, 0);
+
+        let mut buf = make_filled_buf(w, h, black);
+        let snapshot_before = buf.clone();
+
+        // Green line from (0,0) to (99,99) with width 3
+        let ann = Annotation::new(
+            ShapeKind::Line,
+            green,
+            3.0,
+            false,
+            LineStyle::Solid,
+            Pos2::new(0.0, 0.0),
+            Pos2::new(99.0, 99.0),
+        );
+
+        render_annotation_to_buf(&mut buf, w, h, &ann, None);
+
+        // Verify that diagonal pixels have changed (line was drawn)
+        let mut changed_count = 0;
+        for d in 0..100 {
+            let i = (d * w + d) * 4;
+            if buf[i] != snapshot_before[i]
+                || buf[i + 1] != snapshot_before[i + 1]
+                || buf[i + 2] != snapshot_before[i + 2]
+            {
+                changed_count += 1;
+            }
+        }
+        assert!(
+            changed_count > 50,
+            "Line should modify most diagonal pixels, but only {changed_count} changed"
+        );
+
+        // Verify at least one diagonal pixel is green
+        let i_mid = (50 * w + 50) * 4;
+        assert_eq!(buf[i_mid + 1], 255, "Diagonal pixel (50,50) G channel should be 255 (green)");
+    }
+
+    /// Preservation: Mosaic rendering pixelates the region (pixels in a block become uniform).
+    #[test]
+    fn test_mosaic_rendering_preserved() {
+        let w = 100usize;
+        let h = 100usize;
+
+        // Create a buffer with varied pixel content (gradient pattern)
+        let mut buf = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                buf[i]     = (x * 255 / w) as u8;     // R varies by x
+                buf[i + 1] = (y * 255 / h) as u8;     // G varies by y
+                buf[i + 2] = 128;                       // B constant
+                buf[i + 3] = 255;                       // A opaque
+            }
+        }
+        let snapshot_before = buf.clone();
+
+        // Mosaic annotation over region (20,20) to (60,60) with width=5 → block size = max(10, 8) = 10
+        let ann = Annotation::new(
+            ShapeKind::Mosaic,
+            Color32::WHITE, // color is unused for mosaic
+            5.0,
+            false,
+            LineStyle::Solid,
+            Pos2::new(20.0, 20.0),
+            Pos2::new(60.0, 60.0),
+        );
+
+        render_annotation_to_buf(&mut buf, w, h, &ann, None);
+
+        // Verify pixelation occurred: within a mosaic block, all pixels should be uniform.
+        // Block size = max(5.0*2.0, 8) = 10. First block starts at (20,20), ends at (29,29).
+        let block_x0 = 20usize;
+        let block_y0 = 20usize;
+        let block_x1 = 29usize;
+        let block_y1 = 29usize;
+
+        // All pixels in this block should have the same color
+        let ref_i = (block_y0 * w + block_x0) * 4;
+        let (ref_r, ref_g, ref_b) = (buf[ref_i], buf[ref_i + 1], buf[ref_i + 2]);
+
+        for y in block_y0..=block_y1 {
+            for x in block_x0..=block_x1 {
+                let i = (y * w + x) * 4;
+                assert_eq!(buf[i], ref_r, "Mosaic block pixel ({x},{y}) R should be uniform");
+                assert_eq!(buf[i + 1], ref_g, "Mosaic block pixel ({x},{y}) G should be uniform");
+                assert_eq!(buf[i + 2], ref_b, "Mosaic block pixel ({x},{y}) B should be uniform");
+            }
+        }
+
+        // Verify the mosaic actually changed pixels (the gradient was averaged)
+        let mut changed = false;
+        for y in block_y0..=block_y1 {
+            for x in block_x0..=block_x1 {
+                let i = (y * w + x) * 4;
+                if buf[i] != snapshot_before[i] || buf[i + 1] != snapshot_before[i + 1] {
+                    changed = true;
+                    break;
+                }
+            }
+            if changed { break; }
+        }
+        assert!(changed, "Mosaic should have changed at least some pixels from the original gradient");
+
+        // Verify pixels outside the mosaic region are unchanged
+        let i_out = (0 * w + 0) * 4;
+        assert_eq!(buf[i_out], snapshot_before[i_out], "Pixel outside mosaic should be unchanged");
     }
 }
