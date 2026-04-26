@@ -12,8 +12,54 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate release body
+        id: body
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          cat > release-body.md << 'BODY'
+          ## Clip Vault $TAG — 剪贴板管理 + 文件搜索 + 截图标注
+
+          ### 📦 下载安装包
+
+          | 操作系统 | 文件 | 说明 |
+          |---------|------|------|
+          | Windows | `.msi` | 推荐，带安装向导 |
+          | Windows | `.exe` | 免安装便携版 |
+          | macOS (M系列) | `.dmg` | Apple Silicon |
+          | macOS (Intel) | `.dmg` | x86_64 |
+          | Linux | `.deb` | Debian/Ubuntu |
+          | Linux | `.rpm` | Fedora/RHEL |
+          | Linux | `.AppImage` | 免安装，所有发行版通用 |
+
+          ### ✨ 主要功能
+          - 📋 剪贴板历史管理（文本 + 图片）
+          - 🔍 全盘文件搜索（文件名 + 文本内容）
+          - 📷 截图标注（矩形、箭头、画笔、马赛克、文字、序号等）
+          - 📌 截图贴图（置顶悬浮）
+          - 🔄 多设备剪贴板同步
+          - ⌨️ 全局快捷键
+
+          ### 🔒 安全校验
+          下载后请使用 `SHA256SUMS.txt` 验证文件完整性。
+          BODY
+          sed -i "s/\$TAG/${GITHUB_REF_NAME}/g" release-body.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-body.md
+          draft: false
+          prerelease: false
+
   build-windows:
     runs-on: windows-latest
+    needs: create-release
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,6 +102,7 @@ jobs:
 
   build-macos:
     runs-on: macos-latest
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -132,6 +179,7 @@ jobs:
 
   build-linux-deb:
     runs-on: ubuntu-22.04
+    needs: create-release
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -182,6 +230,7 @@ jobs:
 
   build-linux-appimage-rpm:
     runs-on: ubuntu-22.04
+    needs: create-release
     steps:
       - name: Checkout
         uses: actions/checkout@v4
