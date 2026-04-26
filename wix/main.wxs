@@ -46,6 +46,7 @@
                     </Component>
                 </Directory>
             </Directory>
+            <Directory Id='ProgramMenuFolder'/>
         </Directory>
 
         <Feature
