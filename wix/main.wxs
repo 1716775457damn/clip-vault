@@ -1,8 +1,4 @@
 <?xml version='1.0' encoding='windows-1252'?>
-<!--
-  Copyright (C) 2025 Clip Vault Contributors
-  Licensed under MIT
--->
 <Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
     <Product
         Id='*'
@@ -41,19 +37,12 @@
                             DiskId='1'
                             Source='$(var.CargoTargetBinDir)\clip-vault.exe'
                             KeyPath='yes'/>
-                    </Component>
-                </Directory>
-            </Directory>
-            <Directory Id='ProgramMenuFolder'>
-                <Directory Id='ApplicationProgramsFolder' Name='Clip Vault'>
-                    <Component Id='ApplicationShortcut' Guid='B2C3D4E5-F6A7-8901-BCDE-F12345678901' Win64='yes'>
                         <Shortcut Id='ApplicationStartMenuShortcut'
                             Name='Clip Vault'
                             Description='Clipboard manager with search, sync and screenshot'
-                            Target='[#exe0]'
-                            WorkingDirectory='APPLICATIONFOLDER'/>
-                        <RemoveFolder Id='CleanUpShortCut' Directory='ApplicationProgramsFolder' On='uninstall'/>
-                        <RegistryValue Root='HKCU' Key='Software\ClipVault' Name='installed' Type='integer' Value='1' KeyPath='yes'/>
+                            Directory='ProgramMenuFolder'
+                            WorkingDirectory='APPLICATIONFOLDER'
+                            Advertise='yes'/>
                     </Component>
                 </Directory>
             </Directory>
@@ -65,11 +54,10 @@
             Description='Installs Clip Vault.'
             Level='1'
             ConfigurableDirectory='APPLICATIONFOLDER'
-            AllowAdvertise='no'
+            AllowAdvertise='yes'
             Display='expand'
             Absent='disallow'>
             <ComponentRef Id='ClipVaultExe'/>
-            <ComponentRef Id='ApplicationShortcut'/>
         </Feature>
 
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
@@ -77,13 +65,5 @@
         <Icon Id='ProductICO' SourceFile='$(var.CargoTargetBinDir)\clip-vault.exe'/>
         <Property Id='ARPPRODUCTICON' Value='ProductICO'/>
         <Property Id='ARPHELPLINK' Value='https://github.com/1716775457damn/clip-vault'/>
-
-        <UI>
-            <UIRef Id='WixUI_InstallDir'/>
-            <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='InstallDirDlg' Order='2'>1</Publish>
-            <Publish Dialog='InstallDirDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='2'>1</Publish>
-        </UI>
-        <Property Id='WIXUI_INSTALLDIR' Value='APPLICATIONFOLDER'/>
-        <WixVariable Id='WixUILicenseRtf' Value='wix\License.rtf'/>
     </Product>
 </Wix>

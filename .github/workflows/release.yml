@@ -40,12 +40,10 @@ jobs:
         run: cargo install cargo-wix
 
       - name: Build MSI
-        run: cargo wix --no-build --nocapture --target x86_64-pc-windows-msvc
-
-      - name: Rename MSI
         shell: pwsh
         run: |
-          $msi = Get-ChildItem -Path "target/wix/*.msi" | Select-Object -First 1
+          cargo wix --no-build --nocapture --target x86_64-pc-windows-msvc
+          $msi = Get-ChildItem -Path "target/wix/*.msi" -ErrorAction Stop | Select-Object -First 1
           Copy-Item $msi.FullName "clip-vault-windows-x86_64.msi"
 
       - name: Upload to Release
