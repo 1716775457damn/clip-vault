@@ -3,6 +3,7 @@ name = "clip-vault"
 version = "0.3.0"
 edition = "2021"
 license = "MIT"
+description = "Clipboard manager with search, sync and screenshot"
 
 [package.metadata.bundle]
 name = "Clip Vault"
