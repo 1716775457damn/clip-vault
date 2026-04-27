@@ -999,6 +999,15 @@ impl eframe::App for App {
             });
         });
 
+        // Poll for hotkey-triggered capture (always, regardless of active tab)
+        if self.annotate.poll_capture_hotkey() {
+            self.tab = Tab::Annotate;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.annotate.enter_overlay(ctx);
+            ctx.request_repaint();
+        }
+
         // Route
         match self.tab {
             Tab::Clip => {
@@ -1021,13 +1030,6 @@ impl eframe::App for App {
                 // Poll for capture result from background thread
                 if self.annotate.poll_capture() {
                     // Capture ready: restore window and go fullscreen for overlay
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    self.annotate.enter_overlay(ctx);
-                    ctx.request_repaint();
-                }
-                // Poll for hotkey-triggered capture (window already minimized)
-                if self.annotate.poll_capture_hotkey() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     self.annotate.enter_overlay(ctx);
