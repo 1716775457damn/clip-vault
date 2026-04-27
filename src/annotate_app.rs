@@ -1323,9 +1323,16 @@ impl AnnotateApp {
                     egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
                         if let Some(tid) = tex_id {
                             let avail = ui.available_size();
-                            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                            let resp = ui.add(egui::Image::new(egui::load::SizedTexture::new(
                                 tid, egui::vec2(w as f32, h as f32)))
-                                .fit_to_exact_size(avail));
+                                .fit_to_exact_size(avail)
+                                .sense(egui::Sense::click()));
+                            resp.context_menu(|ui| {
+                                if ui.button("🗑 销毁").clicked() {
+                                    *open = false;
+                                    ui.close_menu();
+                                }
+                            });
                         }
                     });
                 },
