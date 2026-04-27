@@ -956,9 +956,7 @@ impl AnnotateApp {
                         self.sample_color(self.cursor_px.0, self.cursor_px.1), self.color_fmt);
                 }
                 if self.sel_start.is_none() && self.smart_rect.is_none() {
-                    painter.text(overlay_rect.center()+Vec2::new(0.0,40.0), egui::Align2::CENTER_CENTER,
-                        "拖拽框选  •  悬停单击智能框选  •  Alt放大镜  •  C取色  •  Esc取消",
-                        egui::FontId::proportional(14.0), Color32::WHITE);
+                    // No hint text — keep overlay clean
                 }
                 ctx.request_repaint();
             });
@@ -1312,6 +1310,7 @@ impl AnnotateApp {
                     .with_title(format!("贴图 {}×{}", w, h))
                     .with_inner_size([w as f32 * *zoom, h as f32 * *zoom])
                     .with_always_on_top()
+                    .with_decorations(false)
                     .with_resizable(true),
                 move |ctx, _| {
                     if ctx.input(|i| i.viewport().close_requested()) { *open = false; }
