@@ -921,22 +921,10 @@ impl eframe::App for App {
             }
         }
 
-        // Close button behavior:
-        // - macOS: no tray icon, so close = quit
-        // - Windows/Linux: minimize to tray (double-click tray or use menu to restore)
+        // Close button → quit application
         if ctx.input(|i| i.viewport().close_requested()) {
-            #[cfg(target_os = "macos")]
-            {
-                self.clip.store.flush_now();
-                std::process::exit(0);
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.clip.query.clear();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                return;
-            }
+            self.clip.store.flush_now();
+            std::process::exit(0);
         }
 
         // Hotkey → show + switch to clip tab
